@@ -32,8 +32,10 @@ from core import (
     FirmType,
     create_the5ers_rules,
 )
+from core.position_sizer import PositionSizer
 from monitoring import TelegramConfig, AlertLevel
 from bots.base_bot import BaseTradingBot
+from signals.trend_filter import TrendFilter, TrendDirection
 
 
 # Default configuration (used if no config file provided)
@@ -190,6 +192,17 @@ class The5ersBot(BaseTradingBot):
         self.slippage_tolerance = config.get('SLIPPAGE_TOLERANCE', 5)
         self.max_retries = config.get('MAX_RETRIES', 3)
 
+        # CRITICAL: Add trend filter and position sizer for drawdown prevention
+        self.trend_filter = TrendFilter()
+        self.position_sizer = PositionSizer(
+            max_risk_pct=0.5,  # Max 0.5% per trade (The5ers is more conservative)
+            min_risk_pct=0.2,
+            kelly_fraction=0.25  # Quarter-Kelly for safety
+        )
+
+        # Track blocked trades for monitoring
+        self.blocked_trades = {"counter_trend": 0, "guardian": 0, "risk_limit": 0}
+
     def _init_connection(self):
         """Initialize MT5 connection (skip in paper mode)."""
         if self.paper_mode:
@@ -258,7 +271,14 @@ class The5ersBot(BaseTradingBot):
             super()._analyze_and_trade(symbol)
 
     def _paper_analyze_and_trade(self, symbol: str):
-        """Paper trading - log signals without executing."""
+        """
+        Paper trading with full trend filter and risk checks.
+
+        This simulates the complete trading flow including:
+        1. Trend filter (blocks counter-trend trades)
+        2. Position sizing based on risk budget
+        3. Pre-trade risk checks
+        """
         logger = logging.getLogger(__name__)
 
         try:
@@ -270,24 +290,58 @@ class The5ersBot(BaseTradingBot):
             if df.empty or len(df) < 100:
                 return
 
-            # Generate signal
+            # Generate signal (now includes trend filtering via SignalGenerator)
             signal = self.signal_generator.generate_signal(symbol, df)
 
-            # Skip if neutral or low confidence
-            if signal.action == "neutral" or signal.confidence < 0.5:
+            # Log trend filter action
+            if signal.filter_reason == "counter_trend_blocked":
+                self.blocked_trades["counter_trend"] += 1
+                logger.info(
+                    f"[{symbol}] BLOCKED {signal.trend_direction} - counter-trend trade prevented"
+                )
                 return
 
-            # Log the signal (paper mode)
+            # Skip if neutral or low confidence
+            if signal.action == "neutral" or signal.confidence < 0.4:
+                return
+
+            # Calculate position size using position sizer
+            current_dd = 0.0  # Paper mode starts at 0% DD
+            if hasattr(self, '_paper_equity') and hasattr(self, 'config'):
+                if self._paper_equity < self.config['ACCOUNT_SIZE']:
+                    current_dd = (1 - self._paper_equity / self.config['ACCOUNT_SIZE']) * 100
+
+            position_info = self.position_sizer.calculate(
+                account_balance=self._paper_balance,
+                current_drawdown_pct=current_dd,
+                max_drawdown_pct=self.firm_rules.max_overall_drawdown_pct,
+                stop_loss_pct=signal.stop_loss_atr_mult * 0.5,  # Estimate SL %
+                signal_confidence=signal.confidence,
+                regime=signal.regime,
+                trend_strength=signal.trend_strength
+            )
+
+            # Skip if position size is zero (guardian proximity)
+            if position_info.size <= 0:
+                self.blocked_trades["guardian"] += 1
+                logger.warning(f"[{symbol}] BLOCKED - position size zero ({position_info.reason})")
+                return
+
+            # Log the signal with trend info (paper mode)
             logger.info(
                 f"PAPER SIGNAL: {signal.action.upper()} {symbol} "
-                f"(confidence: {signal.confidence:.2f}, regime: {signal.regime})"
+                f"(conf: {signal.confidence:.2f}, regime: {signal.regime}, "
+                f"trend: {signal.trend_direction}, strength: {signal.trend_strength:.2f}, "
+                f"aligned: {signal.higher_tf_aligned}, risk: {position_info.risk_pct:.2f}%)"
             )
 
             if self.telegram:
                 self.telegram.send_alert(
                     f"[PAPER] Signal: {signal.action.upper()} {symbol}\n"
                     f"Confidence: {signal.confidence:.2f}\n"
-                    f"Regime: {signal.regime}",
+                    f"Regime: {signal.regime}\n"
+                    f"Trend: {signal.trend_direction} (strength: {signal.trend_strength:.2f})\n"
+                    f"Risk: {position_info.risk_pct:.2f}%",
                     level=AlertLevel.INFO
                 )
 
