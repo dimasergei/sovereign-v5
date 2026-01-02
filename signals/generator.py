@@ -1,8 +1,10 @@
 """
 Signal Generator - Combines all signal sources into trading decisions.
 
-CRITICAL: Now includes TrendFilter to prevent counter-trend trades.
-This is the #1 fix for preventing drawdowns.
+CRITICAL FIX: Now generates signals IN THE DIRECTION OF THE TREND.
+
+Old logic: Generate signal from indicators → Filter by trend
+New logic: Detect trend → Generate signals aligned with trend → Filter confirms
 """
 
 import logging
@@ -139,7 +141,12 @@ class SignalGenerator:
         """
         Generate complete trading signal for a symbol.
 
-        CRITICAL: Now applies trend filter to prevent counter-trend trades.
+        CRITICAL FIX: Generates signals IN THE DIRECTION OF THE TREND.
+
+        Flow:
+        1. Analyze trend FIRST
+        2. Generate signals that align with trend direction
+        3. Apply filter for confirmation (should mostly approve now)
 
         Args:
             symbol: Trading symbol
@@ -162,36 +169,26 @@ class SignalGenerator:
         # 3. Detect regime
         regime, regime_prob = self.regime_detector.detect_regime(df['close'].values)
 
-        # 4. CRITICAL: Analyze trend BEFORE generating signal
+        # 4. CRITICAL: Analyze trend FIRST - this drives signal direction
         trend_state = self.trend_filter.analyze(df)
 
-        # 5. Prepare features for models
-        features = self._prepare_features(df, alt_data)
+        # 5. Get current market data
+        current_price = float(df['close'].iloc[-1])
+        atr = float(df['atr'].iloc[-1]) if 'atr' in df.columns else current_price * 0.02
 
-        # 6. Get ensemble prediction (if available)
-        if self.ensemble:
-            try:
-                ensemble_pred = self.ensemble.predict(features)
-            except Exception as e:
-                logger.error(f"Ensemble prediction failed: {e}")
-                ensemble_pred = None
+        # 6. GENERATE TREND-ALIGNED SIGNALS (KEY FIX)
+        if trend_state.is_trending:
+            # In trending market: generate signals in trend direction
+            raw_signal = self._generate_trend_following_signal(
+                df, trend_state, regime, calibration, current_price, atr
+            )
         else:
-            ensemble_pred = None
+            # In ranging market: generate mean-reversion signals
+            raw_signal = self._generate_mean_reversion_signal(
+                df, trend_state, regime, calibration, current_price, atr
+            )
 
-        # 7. Combine signals to get raw signal
-        raw_signal = self._combine_signals(
-            symbol=symbol,
-            df=df,
-            calibration=calibration,
-            regime=regime,
-            ensemble_pred=ensemble_pred,
-            alt_data=alt_data
-        )
-
-        # 8. Apply regime filter (existing)
-        raw_signal = self._apply_regime_filter(raw_signal, regime)
-
-        # 9. CRITICAL: Apply trend filter - THIS IS THE KEY FIX
+        # 7. Apply trend filter for confirmation (should mostly approve now)
         filtered_action, conf_mult, filter_reason = self.trend_filter.filter_signal(
             raw_signal.action,
             trend_state,
@@ -232,14 +229,14 @@ class SignalGenerator:
                 trend_strength=trend_state.strength,
                 higher_tf_aligned=trend_state.higher_tf_aligned,
                 filter_reason=filter_reason,
-                filters_applied=["trend_filter"],
+                filters_applied=["trend_aware_generation", "trend_filter"],
                 calibration_confidence=calibration.confidence,
                 contributing_models=raw_signal.contributing_models,
-                current_price=raw_signal.current_price,
-                atr=raw_signal.atr,
+                current_price=current_price,
+                atr=atr,
             )
 
-        # Return filtered signal with trend info
+        # Return approved signal with trend info
         return TradingSignal(
             symbol=symbol,
             action=filtered_action,
@@ -253,12 +250,12 @@ class SignalGenerator:
             trend_direction=trend_state.direction.value,
             trend_strength=trend_state.strength,
             higher_tf_aligned=trend_state.higher_tf_aligned,
-            filter_reason=filter_reason,
-            filters_applied=["trend_filter"],
+            filter_reason=filter_reason if filter_reason else raw_signal.filter_reason,
+            filters_applied=["trend_aware_generation", "trend_filter"],
             calibration_confidence=calibration.confidence,
             contributing_models=raw_signal.contributing_models,
-            current_price=raw_signal.current_price,
-            atr=raw_signal.atr,
+            current_price=current_price,
+            atr=atr,
         )
     
     def _get_calibration(
@@ -496,7 +493,7 @@ class SignalGenerator:
     def _neutral_signal(self, symbol: str, reason: str) -> TradingSignal:
         """Return neutral signal."""
         logger.debug(f"Neutral signal for {symbol}: {reason}")
-        
+
         return TradingSignal(
             symbol=symbol,
             action="neutral",
@@ -508,3 +505,259 @@ class SignalGenerator:
             regime="unknown",
             model_agreement=0.0,
         )
+
+    def _generate_trend_following_signal(
+        self,
+        df: pd.DataFrame,
+        trend_state: TrendState,
+        regime: str,
+        calibration: FullCalibrationResult,
+        current_price: float,
+        atr: float
+    ) -> TradingSignal:
+        """
+        Generate signals that FOLLOW the trend.
+
+        CRITICAL: In an uptrend, we ONLY look for long entries.
+        In a downtrend, we ONLY look for short entries.
+        """
+        close = df['close'].values
+
+        # Determine which direction we're looking for
+        if trend_state.direction in [TrendDirection.STRONG_UP, TrendDirection.MILD_UP]:
+            looking_for = "long"
+        elif trend_state.direction in [TrendDirection.STRONG_DOWN, TrendDirection.MILD_DOWN]:
+            looking_for = "short"
+        else:
+            return self._create_signal_result(
+                action="neutral", confidence=0.0, direction=0.0,
+                regime=regime, calibration=calibration,
+                current_price=current_price, atr=atr,
+                entry_reason="no_clear_trend"
+            )
+
+        # Calculate entry timing indicators
+        ma20 = pd.Series(close).rolling(20).mean().iloc[-1]
+        ma50 = pd.Series(close).rolling(50).mean().iloc[-1]
+
+        pullback_to_ma20 = (current_price - ma20) / ma20 * 100 if ma20 > 0 else 0
+        pullback_to_ma50 = (current_price - ma50) / ma50 * 100 if ma50 > 0 else 0
+
+        # RSI for oversold/overbought
+        rsi = self._calculate_rsi(close, 14)
+
+        # MACD momentum confirmation
+        fast_ma = pd.Series(close).ewm(span=12).mean().values
+        slow_ma = pd.Series(close).ewm(span=26).mean().values
+        macd = fast_ma - slow_ma
+        macd_signal = pd.Series(macd).ewm(span=9).mean().values
+        macd_histogram = macd[-1] - macd_signal[-1]
+
+        # LONG ENTRY CONDITIONS (in uptrend)
+        if looking_for == "long":
+            confidence = 0.0
+            entry_reason = None
+
+            # Condition A: Pullback to MA20 in uptrend (high probability)
+            if -3 < pullback_to_ma20 < 0 and trend_state.slope_ma50 > 0:
+                confidence = 0.7
+                entry_reason = "pullback_to_ma20"
+
+            # Condition B: RSI oversold in uptrend (mean reversion within trend)
+            elif rsi < 40 and trend_state.price_vs_ma50 > 0:
+                confidence = 0.65
+                entry_reason = "rsi_oversold_in_uptrend"
+
+            # Condition C: MACD bullish crossover
+            elif len(macd) > 1 and macd[-1] > macd_signal[-1] and macd[-2] <= macd_signal[-2]:
+                confidence = 0.6
+                entry_reason = "macd_bullish_crossover"
+
+            # Condition D: Strong trend continuation (price making new highs)
+            elif current_price >= max(close[-20:]) and trend_state.strength > 0.5:
+                confidence = 0.55
+                entry_reason = "breakout_continuation"
+
+            # Condition E: Price above all MAs with positive momentum
+            elif current_price > ma20 > ma50 and macd_histogram > 0:
+                confidence = 0.5
+                entry_reason = "aligned_momentum"
+
+            if confidence > 0:
+                # Boost confidence if higher TF aligned
+                if trend_state.higher_tf_aligned:
+                    confidence = min(0.95, confidence + 0.15)
+
+                return self._create_signal_result(
+                    action="long", confidence=confidence, direction=0.7,
+                    regime=regime, calibration=calibration,
+                    current_price=current_price, atr=atr,
+                    entry_reason=entry_reason,
+                    trend_direction=trend_state.direction.value,
+                    trend_strength=trend_state.strength
+                )
+
+        # SHORT ENTRY CONDITIONS (in downtrend)
+        elif looking_for == "short":
+            confidence = 0.0
+            entry_reason = None
+
+            # Condition A: Rally to MA20 in downtrend
+            if 0 < pullback_to_ma20 < 3 and trend_state.slope_ma50 < 0:
+                confidence = 0.7
+                entry_reason = "rally_to_ma20"
+
+            # Condition B: RSI overbought in downtrend
+            elif rsi > 60 and trend_state.price_vs_ma50 < 0:
+                confidence = 0.65
+                entry_reason = "rsi_overbought_in_downtrend"
+
+            # Condition C: MACD bearish crossover
+            elif len(macd) > 1 and macd[-1] < macd_signal[-1] and macd[-2] >= macd_signal[-2]:
+                confidence = 0.6
+                entry_reason = "macd_bearish_crossover"
+
+            # Condition D: Breakdown continuation
+            elif current_price <= min(close[-20:]) and trend_state.strength > 0.5:
+                confidence = 0.55
+                entry_reason = "breakdown_continuation"
+
+            # Condition E: Price below all MAs with negative momentum
+            elif current_price < ma20 < ma50 and macd_histogram < 0:
+                confidence = 0.5
+                entry_reason = "aligned_momentum"
+
+            if confidence > 0:
+                if trend_state.higher_tf_aligned:
+                    confidence = min(0.95, confidence + 0.15)
+
+                return self._create_signal_result(
+                    action="short", confidence=confidence, direction=-0.7,
+                    regime=regime, calibration=calibration,
+                    current_price=current_price, atr=atr,
+                    entry_reason=entry_reason,
+                    trend_direction=trend_state.direction.value,
+                    trend_strength=trend_state.strength
+                )
+
+        # No entry condition met
+        return self._create_signal_result(
+            action="neutral", confidence=0.0, direction=0.0,
+            regime=regime, calibration=calibration,
+            current_price=current_price, atr=atr,
+            entry_reason="no_entry_condition"
+        )
+
+    def _generate_mean_reversion_signal(
+        self,
+        df: pd.DataFrame,
+        trend_state: TrendState,
+        regime: str,
+        calibration: FullCalibrationResult,
+        current_price: float,
+        atr: float
+    ) -> TradingSignal:
+        """
+        Generate mean-reversion signals for ranging markets.
+
+        Only used when trend is NEUTRAL and market is mean-reverting.
+        """
+        close = df['close'].values
+
+        # Z-score calculation
+        lookback = 50
+        if len(close) < lookback:
+            lookback = len(close)
+
+        mean = np.mean(close[-lookback:])
+        std = np.std(close[-lookback:])
+
+        if std == 0:
+            return self._create_signal_result(
+                action="neutral", confidence=0.0, direction=0.0,
+                regime=regime, calibration=calibration,
+                current_price=current_price, atr=atr,
+                entry_reason="no_volatility"
+            )
+
+        zscore = (close[-1] - mean) / std
+
+        # RSI
+        rsi = self._calculate_rsi(close, 14)
+
+        # Mean reversion entries - LONG on oversold
+        if zscore < -2.0 and rsi < 30:
+            confidence = min(0.75, 0.5 + abs(zscore) * 0.1)
+            return self._create_signal_result(
+                action="long", confidence=confidence, direction=0.5,
+                regime=regime, calibration=calibration,
+                current_price=current_price, atr=atr,
+                entry_reason="oversold_mean_reversion"
+            )
+
+        # Mean reversion entries - SHORT on overbought
+        elif zscore > 2.0 and rsi > 70:
+            confidence = min(0.75, 0.5 + abs(zscore) * 0.1)
+            return self._create_signal_result(
+                action="short", confidence=confidence, direction=-0.5,
+                regime=regime, calibration=calibration,
+                current_price=current_price, atr=atr,
+                entry_reason="overbought_mean_reversion"
+            )
+
+        return self._create_signal_result(
+            action="neutral", confidence=0.0, direction=0.0,
+            regime=regime, calibration=calibration,
+            current_price=current_price, atr=atr,
+            entry_reason="no_extreme"
+        )
+
+    def _create_signal_result(
+        self,
+        action: str,
+        confidence: float,
+        direction: float,
+        regime: str,
+        calibration: FullCalibrationResult,
+        current_price: float,
+        atr: float,
+        entry_reason: str = "",
+        trend_direction: str = "neutral",
+        trend_strength: float = 0.0
+    ) -> TradingSignal:
+        """Helper to create TradingSignal with common fields."""
+        return TradingSignal(
+            symbol="",  # Will be set by caller
+            action=action,
+            direction=direction,
+            confidence=confidence,
+            position_scalar=confidence,
+            stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
+            take_profit_atr_mult=calibration.take_profit_atr_multiple,
+            regime=regime,
+            model_agreement=1.0,
+            trend_direction=trend_direction,
+            trend_strength=trend_strength,
+            filter_reason=entry_reason,
+            contributing_models=["trend_following"] if action != "neutral" else [],
+            current_price=current_price,
+            atr=atr,
+        )
+
+    def _calculate_rsi(self, prices: np.ndarray, period: int = 14) -> float:
+        """Calculate RSI indicator."""
+        if len(prices) < period + 1:
+            return 50.0  # Neutral default
+
+        deltas = np.diff(prices)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+
+        if avg_loss == 0:
+            return 100.0
+
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
