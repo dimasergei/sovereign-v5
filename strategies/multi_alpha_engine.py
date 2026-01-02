@@ -97,7 +97,7 @@ class MultiAlphaEngine:
             signals.append(trend_signal)
             self.signal_counts[StrategyType.TREND] += 1
 
-        mr_signal = self._mean_reversion_strategy(df)
+        mr_signal = self._mean_reversion_strategy(df, symbol=symbol)
         if mr_signal:
             signals.append(mr_signal)
             self.signal_counts[StrategyType.MEAN_REVERSION] += 1
@@ -217,15 +217,15 @@ class MultiAlphaEngine:
         # Don't trade trend strategy in choppy/transitioning markets
         return None
 
-    def _mean_reversion_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
+    def _mean_reversion_strategy(self, df: pd.DataFrame, symbol: str = None) -> Optional[AlphaSignal]:
         """
-        Mean reversion strategy with TREND BIAS OVERRIDE.
+        Mean reversion strategy with ASSET-AWARE BIAS.
 
-        CRITICAL FIX: In strong uptrends, BLOCK short mean reversion signals.
-        This prevents shorting overbought conditions in bull markets.
+        CRYPTO: NEVER short mean reversion. Only buy oversold dips.
+        The edge in crypto is riding the trend, not fading it.
+        Mean reversion shorts in crypto are consistent losers.
 
-        Edge: Overextended moves tend to snap back.
-        Entry: Price far from mean with reversal signs.
+        FOREX/COMMODITIES: Allow both directions with trend check.
         """
         close = df['close'].values
         high = df['high'].values
@@ -234,61 +234,56 @@ class MultiAlphaEngine:
         if len(close) < 30:
             return None
 
-        # CRITICAL: Calculate trend for bias override
+        # Check if this is crypto - NEVER SHORT CRYPTO MEAN REVERSION
+        is_crypto = symbol and any(c in symbol.upper() for c in ['BTC', 'ETH', 'SOL', 'XRP'])
+
+        # Trend detection with slope-based confirmation
         ema50 = self._ema(close, 50)
         ema50_prev = self._ema(close[:-10], 50) if len(close) > 60 else ema50
-        trend_up = close[-1] > ema50 and close[-10] > ema50_prev
-        trend_down = close[-1] < ema50 and close[-10] < ema50_prev
+        ema50_slope = (ema50 - ema50_prev) / ema50_prev * 100
+        trend_up = close[-1] > ema50 and ema50_slope > -0.5
+        trend_down = close[-1] < ema50 and ema50_slope < 0.5
 
-        # Multiple timeframe mean reversion
-        # Short-term (fast mean reversion)
+        # Z-scores
         ma10 = np.mean(close[-10:])
         std10 = np.std(close[-10:])
         zscore_10 = (close[-1] - ma10) / std10 if std10 > 0 else 0
 
-        # Medium-term
-        ma20 = np.mean(close[-20:])
-        std20 = np.std(close[-20:])
-        zscore_20 = (close[-1] - ma20) / std20 if std20 > 0 else 0
-
-        # RSI for confirmation - faster period for mean reversion
+        # RSI
         rsi = self._rsi(close, 7)
 
         # ATR
         atr = self._atr(high, low, close, 14)
 
-        # LONG: Oversold on short timeframe - ALLOW even in downtrend (catching bounces)
+        # LONG: Oversold bounce - ALWAYS ALLOWED (buying dips works)
         if zscore_10 < -1.5 and rsi < 35:
-            confidence = min(0.70, 0.45 + abs(zscore_10) * 0.1)
+            confidence = min(0.72, 0.45 + abs(zscore_10) * 0.1)
 
             # Boost confidence in uptrend (buying dips in bull market)
             if trend_up:
-                confidence = min(0.80, confidence + 0.10)
+                confidence = min(0.82, confidence + 0.12)
 
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
                 direction=1.0,
                 confidence=confidence,
                 expected_move=abs(zscore_10) * std10 / close[-1] * 100 * 0.5,
-                holding_period=5,  # Short hold for MR
+                holding_period=5,
                 stop_distance=1.0,
                 entry_reason="mean_reversion_oversold"
             )
 
-        # SHORT: Overbought on short timeframe
-        # CRITICAL: Block short signals in strong uptrend!
+        # SHORT: Overbought fade
         if zscore_10 > 1.5 and rsi > 65:
-            # DON'T SHORT IN UPTREND - this was killing BTCUSD performance
-            if trend_up:
-                return None  # Skip this signal entirely
+            # CRYPTO: NEVER SHORT MEAN REVERSION - this was killing BTCUSD
+            if is_crypto:
+                return None
 
-            confidence = min(0.70, 0.45 + abs(zscore_10) * 0.1)
+            # NON-CRYPTO: Only short in confirmed downtrend
+            if not trend_down:
+                return None
 
-            # Only take with good confidence in downtrend
-            if trend_down:
-                confidence = min(0.75, confidence + 0.05)
-            else:
-                confidence *= 0.8  # Reduce confidence in neutral trend
+            confidence = min(0.68, 0.42 + abs(zscore_10) * 0.08)
 
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
@@ -298,41 +293,6 @@ class MultiAlphaEngine:
                 holding_period=5,
                 stop_distance=1.0,
                 entry_reason="mean_reversion_overbought"
-            )
-
-        # MEDIUM-TERM mean reversion (less frequent but higher conviction)
-        if zscore_20 < -2.0 and zscore_10 < -1.0:
-            confidence = 0.65
-            if trend_up:
-                confidence = min(0.75, confidence + 0.10)
-
-            return AlphaSignal(
-                strategy=StrategyType.MEAN_REVERSION,
-                direction=1.0,
-                confidence=confidence,
-                expected_move=abs(zscore_20) * std20 / close[-1] * 100 * 0.5,
-                holding_period=8,
-                stop_distance=1.2,
-                entry_reason="mean_reversion_deep_oversold"
-            )
-
-        # Deep overbought - still block in uptrend
-        if zscore_20 > 2.0 and zscore_10 > 1.0:
-            if trend_up:
-                return None  # Don't short in uptrend
-
-            confidence = 0.65
-            if trend_down:
-                confidence = min(0.70, confidence + 0.05)
-
-            return AlphaSignal(
-                strategy=StrategyType.MEAN_REVERSION,
-                direction=-1.0,
-                confidence=confidence,
-                expected_move=abs(zscore_20) * std20 / close[-1] * 100 * 0.5,
-                holding_period=8,
-                stop_distance=1.2,
-                entry_reason="mean_reversion_deep_overbought"
             )
 
         return None
