@@ -189,40 +189,47 @@ def generate_signals(
     logger.info(f"Calibrating on {calibration_size} bars, trading on {len(trading_df)} bars")
 
     # Initialize components
-    calibrator = MarketCalibrator()
+    calibrator = MarketCalibrator(min_calibration_bars=50)  # Lower for backtesting
     feature_engineer = FeatureEngineer()
     regime_detector = RegimeDetector()
 
     # Calibrate on first portion
     try:
-        calibrator.full_calibration(
-            calibration_df['close'].values,
-            calibration_df['high'].values,
-            calibration_df['low'].values,
-            calibration_df.get('volume', pd.Series(np.ones(len(calibration_df)))).values
-        )
+        calibration_result = calibrator.calibrate_all(calibration_df)
+        logger.info(f"Calibration: regime={calibration_result.current_regime}, "
+                   f"fast={calibration_result.fast_period}, slow={calibration_result.slow_period}")
     except Exception as e:
         logger.warning(f"Calibration failed: {e}, using defaults")
 
-    # Initialize signal generator
+    # Initialize signal generator with lower min_confidence for backtesting
     signal_gen = SignalGenerator(
         calibrator=calibrator,
         feature_engineer=feature_engineer,
         regime_detector=regime_detector,
-        min_confidence=0.4
+        min_confidence=0.3  # Lower threshold for backtesting
     )
 
     # Generate signals for trading period
     signals = []
+    errors = 0
 
-    # We need context, so use rolling window
-    window_size = min(200, calibration_size)
+    # We need context - at least 100 bars for signal generator, prefer 200
+    # Use all available historical data up to window_size
+    window_size = min(200, len(df) - 1)
+
+    min_context_bars = 100  # Minimum bars needed for signal generation
 
     for i in range(len(trading_df)):
-        # Get context window
-        start_idx = max(0, calibration_size + i - window_size)
-        end_idx = calibration_size + i + 1
+        # Get context window - include all available history up to current bar
+        current_idx = calibration_size + i
+        start_idx = max(0, current_idx - window_size)
+        end_idx = current_idx + 1
         context_df = df.iloc[start_idx:end_idx].copy()
+
+        # Skip if not enough history yet
+        if len(context_df) < min_context_bars:
+            signals.append(0)
+            continue
 
         try:
             signal = signal_gen.generate_signal(symbol, context_df)
@@ -233,9 +240,19 @@ def generate_signals(
                 signals.append(-1)
             else:
                 signals.append(0)
+
+            # Debug first few signals
+            if i < 5:
+                logger.debug(f"Bar {i}: action={signal.action}, direction={signal.direction:.3f}, "
+                           f"confidence={signal.confidence:.3f}")
         except Exception as e:
-            logger.debug(f"Signal generation failed at {i}: {e}")
+            errors += 1
+            if errors <= 5:
+                logger.warning(f"Signal generation failed at bar {i}: {e}")
             signals.append(0)
+
+    if errors > 0:
+        logger.warning(f"Total signal generation errors: {errors}/{len(trading_df)}")
 
     signal_series = pd.Series(signals, index=trading_df.index)
 
