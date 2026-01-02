@@ -202,23 +202,19 @@ def generate_signals(
     except Exception as e:
         logger.warning(f"Calibration failed: {e}, using defaults")
 
-    # Initialize signal generator with lower min_confidence for backtesting
-    signal_gen = SignalGenerator(
-        calibrator=calibrator,
-        feature_engineer=feature_engineer,
-        regime_detector=regime_detector,
-        min_confidence=0.3  # Lower threshold for backtesting
-    )
+    # Initialize new institutional signal generator
+    signal_gen = SignalGenerator(min_confidence=0.5)
 
     # Generate signals for trading period
     signals = []
+    entry_reasons = []
     errors = 0
 
     # We need context - at least 100 bars for signal generator, prefer 200
     # Use all available historical data up to window_size
     window_size = min(200, len(df) - 1)
 
-    min_context_bars = 100  # Minimum bars needed for signal generation
+    min_context_bars = 60  # Minimum bars needed for signal generation
 
     for i in range(len(trading_df)):
         # Get context window - include all available history up to current bar
@@ -230,10 +226,12 @@ def generate_signals(
         # Skip if not enough history yet
         if len(context_df) < min_context_bars:
             signals.append(0)
+            entry_reasons.append("")
             continue
 
         try:
-            signal = signal_gen.generate_signal(symbol, context_df)
+            # New interface: generate_signal(df, symbol)
+            signal = signal_gen.generate_signal(context_df, symbol)
 
             if signal.action == 'long':
                 signals.append(1)
@@ -242,18 +240,30 @@ def generate_signals(
             else:
                 signals.append(0)
 
+            # Track entry reasons
+            entry_reasons.append(signal.entry_reason if signal.entry_reason else signal.filter_reason)
+
             # Debug first few signals
             if i < 5:
                 logger.debug(f"Bar {i}: action={signal.action}, direction={signal.direction:.3f}, "
-                           f"confidence={signal.confidence:.3f}")
+                           f"confidence={signal.confidence:.3f}, reason={signal.entry_reason}")
         except Exception as e:
             errors += 1
             if errors <= 5:
                 logger.warning(f"Signal generation failed at bar {i}: {e}")
             signals.append(0)
+            entry_reasons.append("error")
 
     if errors > 0:
         logger.warning(f"Total signal generation errors: {errors}/{len(trading_df)}")
+
+    # Log entry reason distribution
+    reason_counts = {}
+    for reason in entry_reasons:
+        if reason:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    if reason_counts:
+        logger.info(f"Entry reasons: {reason_counts}")
 
     signal_series = pd.Series(signals, index=trading_df.index)
 
@@ -263,11 +273,14 @@ def generate_signals(
     neutral_signals = (signal_series == 0).sum()
     logger.info(f"Signals: Long={long_signals}, Short={short_signals}, Neutral={neutral_signals}")
 
-    # Log trend filter stats (CRITICAL - this shows counter-trend prevention)
-    blocked_counter_trend = signal_gen.blocked_signals.get("counter_trend", 0)
-    blocked_low_conf = signal_gen.blocked_signals.get("low_confidence", 0)
-    logger.info(f"Trend Filter: Blocked {blocked_counter_trend} counter-trend signals, "
-               f"{blocked_low_conf} low-confidence signals")
+    # Log blocking stats (CRITICAL - shows why signals were rejected)
+    blocked_stats = signal_gen.get_blocked_stats()
+    blocked_chasing = blocked_stats.get("chasing", 0)
+    blocked_pullback = blocked_stats.get("no_pullback", 0)
+    blocked_confirm = blocked_stats.get("no_confirmation", 0)
+    blocked_vol = blocked_stats.get("volatility", 0)
+    logger.info(f"Blocked: chasing={blocked_chasing}, no_pullback={blocked_pullback}, "
+               f"no_confirmation={blocked_confirm}, volatility={blocked_vol}")
 
     # Calculate long/short ratio (CRITICAL for trend following)
     if short_signals > 0:
@@ -303,9 +316,9 @@ def run_backtest(
     # Align data with signals
     df_aligned = df.loc[signals.index].copy()
 
-    # Use GUARDIAN threshold - stop 1.5% before actual limit
+    # Use GUARDIAN threshold - stop 2.0% before actual limit
     # This is critical for prop firm safety - gives buffer for slippage/volatility
-    guardian_threshold = max_dd - 1.5  # 4.5% for 6% limit
+    guardian_threshold = max_dd - 2.0  # 4.0% for 6% limit
     logger.info(f"Using guardian threshold: {guardian_threshold}% (actual limit: {max_dd}%)")
 
     config = BacktestConfig(
