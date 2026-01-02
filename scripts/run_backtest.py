@@ -134,8 +134,13 @@ def fetch_data(symbol: str, days: int) -> pd.DataFrame:
         if data.empty:
             raise ValueError(f"No data returned for {ticker}")
 
-        # Standardize column names
-        data.columns = [c.lower() for c in data.columns]
+        # Handle MultiIndex columns (yfinance returns tuples like ('Open', 'BTC-USD'))
+        if isinstance(data.columns, pd.MultiIndex):
+            # Flatten MultiIndex - take first level (the OHLCV names)
+            data.columns = data.columns.get_level_values(0)
+
+        # Standardize column names (handle both string and tuple cases)
+        data.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in data.columns]
 
         # Rename adj close to close if needed
         if 'adj close' in data.columns:
