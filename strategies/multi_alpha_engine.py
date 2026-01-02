@@ -236,11 +236,10 @@ class MultiAlphaEngine:
         """
         Mean reversion strategy with ASSET-AWARE BIAS.
 
-        CRYPTO: NEVER short mean reversion. Only buy oversold dips.
-        The edge in crypto is riding the trend, not fading it.
-        Mean reversion shorts in crypto are consistent losers.
+        CRYPTO: Stricter requirements - deeper oversold (z < -2.0), RSI < 30,
+        and bullish candle confirmation. Crypto is too volatile for normal MR.
 
-        FOREX/COMMODITIES: Allow both directions with trend check.
+        FOREX/COMMODITIES: Standard z < -1.5 threshold with trend check.
         """
         close = df['close'].values
         high = df['high'].values
@@ -249,8 +248,7 @@ class MultiAlphaEngine:
         if len(close) < 30:
             return None
 
-        # Check if this is crypto - NEVER SHORT CRYPTO MEAN REVERSION
-        is_crypto = symbol and any(c in symbol.upper() for c in ['BTC', 'ETH', 'SOL', 'XRP'])
+        is_crypto = self._is_crypto(symbol)
 
         # Trend detection with slope-based confirmation
         ema50 = self._ema(close, 50)
@@ -270,7 +268,28 @@ class MultiAlphaEngine:
         # ATR
         atr = self._atr(high, low, close, 14)
 
-        # LONG: Oversold bounce - ALWAYS ALLOWED (buying dips works)
+        # CRYPTO: Stricter oversold requirements
+        # Need deeper oversold (z < -2.0), RSI < 30, and bullish candle
+        if is_crypto:
+            is_bullish_candle = close[-1] > close[-2]
+
+            if zscore_10 < -2.0 and rsi < 30 and is_bullish_candle:
+                confidence = min(0.75, 0.50 + abs(zscore_10) * 0.08)
+                if trend_up:
+                    confidence = min(0.85, confidence + 0.10)
+
+                return AlphaSignal(
+                    strategy=StrategyType.MEAN_REVERSION,
+                    direction=1.0,
+                    confidence=confidence,
+                    expected_move=abs(zscore_10) * std10 / close[-1] * 100 * 0.5,
+                    holding_period=5,
+                    stop_distance=1.5,  # Wider stop for crypto volatility
+                    entry_reason="mean_reversion_oversold"
+                )
+            return None  # No MR signal for crypto if conditions not met
+
+        # NON-CRYPTO: Standard oversold threshold
         if zscore_10 < -1.5 and rsi < 35:
             confidence = min(0.72, 0.45 + abs(zscore_10) * 0.1)
 
@@ -288,12 +307,8 @@ class MultiAlphaEngine:
                 entry_reason="mean_reversion_oversold"
             )
 
-        # SHORT: Overbought fade
+        # SHORT: Overbought fade (already blocked for crypto above)
         if zscore_10 > 1.5 and rsi > 65:
-            # CRYPTO: NEVER SHORT MEAN REVERSION - this was killing BTCUSD
-            if is_crypto:
-                return None
-
             # NON-CRYPTO: Only short in confirmed downtrend
             if not trend_down:
                 return None
