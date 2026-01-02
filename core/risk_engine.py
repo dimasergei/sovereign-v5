@@ -15,7 +15,15 @@ Features:
 
 import json
 import logging
-import MetaTrader5 as mt5
+
+# MT5 is optional - only available on Windows
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Tuple, Any, Callable
@@ -532,6 +540,8 @@ class RiskManager:
 
     def _would_exceed_concentration_limit(self, proposed_trade: dict) -> bool:
         """Check if trade would create dangerous concentration."""
+        if not MT5_AVAILABLE or mt5 is None:
+            return False  # Can't check without MT5
         try:
             positions = mt5.positions_get()
             if not positions:
@@ -711,6 +721,9 @@ class RiskManager:
         if not self.rules.max_trade_floating_loss_pct:
             return []
 
+        if not MT5_AVAILABLE or mt5 is None:
+            return []  # Can't monitor without MT5
+
         positions_to_close = []
 
         try:
@@ -763,6 +776,10 @@ class RiskManager:
         Returns:
             True if closed successfully
         """
+        if not MT5_AVAILABLE or mt5 is None:
+            logger.warning("Cannot emergency close - MT5 not available")
+            return False
+
         try:
             position = mt5.positions_get(ticket=ticket)
             if not position:
@@ -839,6 +856,9 @@ class RiskManager:
         """
         if not self.rules.max_trade_floating_loss_pct:
             return True, None
+
+        if not MT5_AVAILABLE or mt5 is None:
+            return True, None  # Can't check without MT5
 
         try:
             symbol_info = mt5.symbol_info(symbol)
@@ -1239,6 +1259,8 @@ class RiskManager:
     
     def _get_open_position_count(self) -> int:
         """Get current number of open positions."""
+        if not MT5_AVAILABLE or mt5 is None:
+            return 0
         try:
             positions = mt5.positions_get()
             return len(positions) if positions else 0
@@ -1247,16 +1269,18 @@ class RiskManager:
     
     def _would_create_hedge(self, symbol: str, direction: str) -> bool:
         """Check if trade would create a hedge."""
+        if not MT5_AVAILABLE or mt5 is None:
+            return False
         try:
             positions = mt5.positions_get(symbol=symbol)
             if not positions:
                 return False
-            
+
             for pos in positions:
                 existing_dir = "buy" if pos.type == mt5.POSITION_TYPE_BUY else "sell"
                 if existing_dir != direction:
                     return True
-            
+
             return False
         except:
             return False
