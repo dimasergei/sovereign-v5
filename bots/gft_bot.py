@@ -114,17 +114,33 @@ class GFTBot(BaseTradingBot):
     def _check_inactivity(self):
         """
         GFT-specific inactivity check.
-        
+
         GFT requires at least one trade every 30 days.
-        We warn at 25 days.
+        Guardian warning at 25 days, auto-ping at 28 days.
         """
         super()._check_inactivity()
-        
+
         days_inactive = self.risk_manager.state.days_since_last_trade
-        
+        logger = logging.getLogger(__name__)
+
         if days_inactive >= 28:
-            # Critical - place a minimal trade
+            # Critical - place a minimal trade immediately
+            logger.critical(f"Inactivity critical: {days_inactive} days - placing ping trade")
             self._place_ping_trade()
+        elif days_inactive >= 25:
+            # Warning - approaching limit
+            logger.warning(f"Inactivity warning: {days_inactive} days since last trade")
+            if self.telegram:
+                self.telegram.send_alert(
+                    f"⚠️ Inactivity Warning\n"
+                    f"Days since last trade: {days_inactive}\n"
+                    f"Auto-ping at 28 days\n"
+                    f"Max limit: 30 days",
+                    level="warning"
+                )
+        elif days_inactive >= 20:
+            # Info - reminder
+            logger.info(f"Inactivity reminder: {days_inactive} days since last trade")
     
     def _place_ping_trade(self):
         """Place minimal trade to avoid inactivity violation."""

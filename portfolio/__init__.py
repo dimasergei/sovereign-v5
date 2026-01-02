@@ -9,12 +9,32 @@ from .construction.hierarchical_risk import (
     MeanVarianceOptimizer
 )
 
+from .optimization.constraints import (
+    PortfolioConstraints,
+    PositionLimit,
+    CorrelationConstraint,
+)
+
+from .optimization.solver import (
+    PortfolioOptimizer,
+    OptimizationResult,
+    OptimizationMethod,
+)
+
 
 __all__ = [
+    # Construction
     'BlackLittermanModel',
     'View',
     'ViewGenerator',
     'HierarchicalRiskParity',
     'RiskParityModel',
     'MeanVarianceOptimizer',
+    # Optimization
+    'PortfolioConstraints',
+    'PositionLimit',
+    'CorrelationConstraint',
+    'PortfolioOptimizer',
+    'OptimizationResult',
+    'OptimizationMethod',
 ]
