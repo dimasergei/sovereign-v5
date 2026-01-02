@@ -177,7 +177,7 @@ class MultiAlphaEngine:
                         strategy=StrategyType.TREND,
                         direction=1.0,
                         confidence=confidence,
-                        expected_move=atr / close[-1] * 100 * 2.5,
+                        expected_move=atr / close[-1] * 100 * 3.0,  # Was 2.5
                         holding_period=10,
                         stop_distance=1.5,
                         entry_reason="trend_momentum_long"
@@ -191,11 +191,27 @@ class MultiAlphaEngine:
                         strategy=StrategyType.TREND,
                         direction=1.0,
                         confidence=confidence,
-                        expected_move=atr / close[-1] * 100 * 2,
+                        expected_move=atr / close[-1] * 100 * 2.5,  # Was 2.0
                         holding_period=8,
                         stop_distance=1.2,
                         entry_reason="trend_pullback_long"
                     )
+
+        # CRYPTO PULLBACK ENTRY - additional opportunity in neutral environments
+        # Crypto trends hard so we want more entries when dipping to support
+        if is_crypto and close[-1] > ema50:
+            # Price dipped to EMA20 zone but bouncing (bullish candle)
+            if close[-1] < ema20 * 1.01 and close[-1] > ema50 and close[-1] > close[-2]:
+                confidence = 0.60
+                return AlphaSignal(
+                    strategy=StrategyType.TREND,
+                    direction=1.0,
+                    confidence=confidence,
+                    expected_move=atr / close[-1] * 100 * 2.5,
+                    holding_period=8,
+                    stop_distance=1.2,
+                    entry_reason="crypto_pullback_long"
+                )
 
         # SHORT: Only in macro bearish environment
         # CRYPTO: NEVER SHORT - the edge is riding trends, not fading them
@@ -208,7 +224,7 @@ class MultiAlphaEngine:
                         strategy=StrategyType.TREND,
                         direction=-1.0,
                         confidence=confidence,
-                        expected_move=atr / close[-1] * 100 * 2.5,
+                        expected_move=atr / close[-1] * 100 * 3.0,  # Was 2.5
                         holding_period=10,
                         stop_distance=1.5,
                         entry_reason="trend_momentum_short"
@@ -222,7 +238,7 @@ class MultiAlphaEngine:
                         strategy=StrategyType.TREND,
                         direction=-1.0,
                         confidence=confidence,
-                        expected_move=atr / close[-1] * 100 * 2,
+                        expected_move=atr / close[-1] * 100 * 2.5,  # Was 2.0
                         holding_period=8,
                         stop_distance=1.2,
                         entry_reason="trend_rally_short"
@@ -593,7 +609,7 @@ class MultiAlphaEngine:
         position_size = max(0.4, min(1.0, position_size))  # Min 40%, max 100%
 
         # Determine action - LOWER threshold: 0.40 instead of 0.50
-        if abs(final_direction) < 0.2 or final_confidence < 0.40:
+        if abs(final_direction) < 0.2 or final_confidence < 0.35:
             action = "neutral"
             position_size = 0
         elif final_direction > 0:
