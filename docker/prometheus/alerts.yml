@@ -1,0 +1,189 @@
+# =============================================================================
+# PROMETHEUS ALERTING RULES
+# =============================================================================
+# Critical alerts for trading system monitoring
+
+groups:
+  # ---------------------------------------------------------------------------
+  # Risk Management Alerts
+  # ---------------------------------------------------------------------------
+  - name: risk_alerts
+    interval: 10s
+    rules:
+      # Drawdown approaching limit
+      - alert: DrawdownWarning
+        expr: trading_drawdown_percent > 5
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drawdown warning on {{ $labels.account }}"
+          description: "Current drawdown is {{ $value | printf \"%.2f\" }}% (warning threshold: 5%)"
+
+      - alert: DrawdownCritical
+        expr: trading_drawdown_percent > 7
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "CRITICAL: Drawdown limit approaching on {{ $labels.account }}"
+          description: "Current drawdown is {{ $value | printf \"%.2f\" }}% - approaching 8% limit!"
+
+      - alert: DrawdownBreach
+        expr: trading_drawdown_percent >= 8
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "EMERGENCY: Drawdown limit BREACHED on {{ $labels.account }}"
+          description: "Drawdown has reached {{ $value | printf \"%.2f\" }}% - trading should be halted!"
+
+      # Daily loss alerts
+      - alert: DailyLossWarning
+        expr: -trading_daily_pnl / trading_account_balance * 100 > 3
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Daily loss warning on {{ $labels.account }}"
+          description: "Daily loss is {{ $value | printf \"%.2f\" }}% (warning threshold: 3%)"
+
+      - alert: DailyLossCritical
+        expr: -trading_daily_pnl / trading_account_balance * 100 > 4
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "CRITICAL: Daily loss limit approaching on {{ $labels.account }}"
+          description: "Daily loss is {{ $value | printf \"%.2f\" }}% - approaching 5% limit!"
+
+  # ---------------------------------------------------------------------------
+  # System Health Alerts
+  # ---------------------------------------------------------------------------
+  - name: system_alerts
+    interval: 30s
+    rules:
+      # Bot disconnection
+      - alert: BotDisconnected
+        expr: trading_connection_status == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bot disconnected: {{ $labels.account }}"
+          description: "Trading bot {{ $labels.account }} has been disconnected for more than 2 minutes"
+
+      # No heartbeat
+      - alert: NoHeartbeat
+        expr: time() - trading_heartbeat_timestamp > 300
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No heartbeat from {{ $labels.account }}"
+          description: "No heartbeat received from {{ $labels.account }} for over 5 minutes"
+
+      # High error rate
+      - alert: HighErrorRate
+        expr: rate(trading_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.account }}"
+          description: "Error rate is {{ $value | printf \"%.2f\" }} errors/second"
+
+      # High latency
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, rate(trading_operation_latency_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High latency on {{ $labels.account }}"
+          description: "95th percentile latency is {{ $value | printf \"%.2f\" }} seconds"
+
+  # ---------------------------------------------------------------------------
+  # Trading Performance Alerts
+  # ---------------------------------------------------------------------------
+  - name: performance_alerts
+    interval: 1m
+    rules:
+      # Low margin level
+      - alert: LowMarginLevel
+        expr: trading_margin_level_percent < 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low margin level on {{ $labels.account }}"
+          description: "Margin level is {{ $value | printf \"%.0f\" }}% (warning threshold: 200%)"
+
+      - alert: CriticalMarginLevel
+        expr: trading_margin_level_percent < 120
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CRITICAL: Margin level dangerously low on {{ $labels.account }}"
+          description: "Margin level is {{ $value | printf \"%.0f\" }}% - margin call imminent!"
+
+      # Win rate degradation
+      - alert: LowWinRate
+        expr: |
+          (
+            sum(increase(trading_trades_won_total[24h])) /
+            sum(increase(trading_trades_total[24h]))
+          ) < 0.4
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low win rate on {{ $labels.account }}"
+          description: "24h win rate is {{ $value | printf \"%.1f\" }}% (threshold: 40%)"
+
+      # No trades for extended period (during market hours)
+      - alert: NoTradingActivity
+        expr: increase(trading_trades_total[6h]) == 0
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "No trading activity on {{ $labels.account }}"
+          description: "No trades executed in the last 6 hours"
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure Alerts
+  # ---------------------------------------------------------------------------
+  - name: infrastructure_alerts
+    interval: 30s
+    rules:
+      # Prometheus target down
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Target {{ $labels.job }} is down"
+          description: "Prometheus cannot scrape {{ $labels.instance }}"
+
+      # High memory usage (if node_exporter is used)
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | printf \"%.1f\" }}%"
+
+      # Disk space low
+      - alert: LowDiskSpace
+        expr: (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Disk usage is {{ $value | printf \"%.1f\" }}%"

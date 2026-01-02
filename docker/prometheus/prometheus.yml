@@ -1,0 +1,70 @@
+# =============================================================================
+# PROMETHEUS CONFIGURATION
+# =============================================================================
+# Metrics collection and alerting rules
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: 'production'
+    system: 'sovereign-trading'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Rule files
+rule_files:
+  - '/etc/prometheus/alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # GFT Bot metrics
+  - job_name: 'gft-bot'
+    static_configs:
+      - targets: ['gft-bot:9090']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'gft-bot'
+      - target_label: account
+        replacement: 'gft'
+      - target_label: bot_type
+        replacement: 'crypto'
+
+  # The5ers Bot metrics
+  - job_name: 'the5ers-bot'
+    static_configs:
+      - targets: ['the5ers-bot:9090']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: 'the5ers-bot'
+      - target_label: account
+        replacement: 'the5ers'
+      - target_label: bot_type
+        replacement: 'forex'
+
+  # Redis metrics (if redis_exporter is used)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+
+  # Node exporter (system metrics, if deployed)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):\d+'
+        replacement: '${1}'

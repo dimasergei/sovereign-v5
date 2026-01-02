@@ -1,0 +1,245 @@
+# =============================================================================
+# INSTITUTIONAL PROP TRADING SYSTEM - DOCKER COMPOSE
+# =============================================================================
+# Complete stack with trading bots, monitoring, and alerting
+
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Trading Bots
+  # ---------------------------------------------------------------------------
+  
+  # GFT Crypto Bot
+  gft-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: sovereign-gft-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TYPE=gft
+      - ACCOUNT_NAME=gft_main
+      - MT5_LOGIN=${GFT_MT5_LOGIN}
+      - MT5_PASSWORD=${GFT_MT5_PASSWORD}
+      - MT5_SERVER=${GFT_MT5_SERVER}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - METRICS_PORT=9090
+      - LOG_LEVEL=INFO
+    volumes:
+      - gft-data:/app/data
+      - gft-logs:/app/logs
+      - gft-models:/app/models_saved
+      - ./config/gft.yaml:/app/config/bot.yaml:ro
+    ports:
+      - "9091:9090"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # The5ers Forex Bot
+  the5ers-bot:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: sovereign-the5ers-bot
+    restart: unless-stopped
+    environment:
+      - BOT_TYPE=the5ers
+      - ACCOUNT_NAME=the5ers_main
+      - MT5_LOGIN=${THE5ERS_MT5_LOGIN}
+      - MT5_PASSWORD=${THE5ERS_MT5_PASSWORD}
+      - MT5_SERVER=${THE5ERS_MT5_SERVER}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - METRICS_PORT=9090
+      - LOG_LEVEL=INFO
+    volumes:
+      - the5ers-data:/app/data
+      - the5ers-logs:/app/logs
+      - the5ers-models:/app/models_saved
+      - ./config/the5ers.yaml:/app/config/bot.yaml:ro
+    ports:
+      - "9092:9090"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ---------------------------------------------------------------------------
+  # Monitoring Stack
+  # ---------------------------------------------------------------------------
+  
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: sovereign-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana - Dashboards
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: sovereign-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-piechart-panel
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      - trading-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Alertmanager - Alert Routing
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: sovereign-alertmanager
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9093:9093"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Optional Services
+  # ---------------------------------------------------------------------------
+  
+  # Redis - Caching and Message Queue
+  redis:
+    image: redis:7-alpine
+    container_name: sovereign-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # PostgreSQL - Historical Data Storage (optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: sovereign-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-sovereign}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-sovereign}
+      - POSTGRES_DB=${POSTGRES_DB:-trading}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sovereign}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - full
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  trading-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# -----------------------------------------------------------------------------
+# Volumes
+# -----------------------------------------------------------------------------
+volumes:
+  # Bot data
+  gft-data:
+  gft-logs:
+  gft-models:
+  the5ers-data:
+  the5ers-logs:
+  the5ers-models:
+  
+  # Monitoring data
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+  
+  # Optional services
+  redis-data:
+  postgres-data:
