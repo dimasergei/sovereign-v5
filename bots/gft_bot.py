@@ -212,6 +212,11 @@ class GFTBot(BaseTradingBot):
             self._paper_balance = self.config['ACCOUNT_SIZE']
             self._paper_equity = self.config['ACCOUNT_SIZE']
             self._paper_positions = []
+
+            # Initialize paper data fetcher for market data
+            from data.paper_fetcher import PaperDataFetcher
+            self.data_fetcher = PaperDataFetcher()
+            logger.info("PAPER MODE: Using PaperDataFetcher for market data")
             return
 
         # Normal connection
