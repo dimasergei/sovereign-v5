@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Backtest Runner - Command-line interface for running strategy backtests.
+Backtest Runner - Multi-Alpha High-Frequency Strategy.
 
 Fetches historical data from Yahoo Finance and runs backtests using the
-signal generation and backtesting modules.
+Renaissance-style multi-alpha signal generation.
+
+Key metrics to track:
+- Number of trades (target: 80+)
+- Win rate (target: 50%+)
+- Average win vs average loss (target: 2:1 R:R)
+- Total return (target: +30%+)
+- Max drawdown (must stay under 4%)
+- Sharpe ratio (target: >1.5)
 
 Usage:
-    python scripts/run_backtest.py --symbol BTCUSD --days 365
-    python scripts/run_backtest.py --symbol XAUUSD --days 730 --max-dd 8.5 --output reports/xauusd.html
+    python scripts/run_backtest.py --symbol BTCUSD --days 365 --verbose
+    python scripts/run_backtest.py --symbol XAUUSD --days 730 --max-dd 8.5
     python scripts/run_backtest.py --symbol NAS100 --days 365 --capital 50000
 """
 
@@ -41,11 +49,8 @@ from backtesting import (
     DrawdownAnalyzer,
     generate_html_report,
 )
-from core.lossless import MarketCalibrator
-from data import FeatureEngineer
-from models import RegimeDetector, EnsembleMetaLearner
 from signals.generator import SignalGenerator, TradingSignal
-from signals.trend_filter import TrendFilter, TrendDirection
+from config.trading_params import get_params
 
 
 # Symbol mappings to Yahoo Finance tickers
@@ -91,16 +96,13 @@ logger = logging.getLogger(__name__)
 
 def get_yahoo_ticker(symbol: str) -> str:
     """Convert trading symbol to Yahoo Finance ticker."""
-    # Strip .x suffix if present
     clean_symbol = symbol.replace('.x', '').upper()
 
-    # Check mapping
     if symbol in SYMBOL_MAP:
         return SYMBOL_MAP[symbol]
     if clean_symbol in SYMBOL_MAP:
         return SYMBOL_MAP[clean_symbol]
 
-    # Default: assume it's already a valid ticker
     return symbol
 
 
@@ -135,26 +137,22 @@ def fetch_data(symbol: str, days: int) -> pd.DataFrame:
         if data.empty:
             raise ValueError(f"No data returned for {ticker}")
 
-        # Handle MultiIndex columns (yfinance returns tuples like ('Open', 'BTC-USD'))
+        # Handle MultiIndex columns
         if isinstance(data.columns, pd.MultiIndex):
-            # Flatten MultiIndex - take first level (the OHLCV names)
             data.columns = data.columns.get_level_values(0)
 
-        # Standardize column names (handle both string and tuple cases)
+        # Standardize column names
         data.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in data.columns]
 
-        # Rename adj close to close if needed
         if 'adj close' in data.columns:
             data['close'] = data['adj close']
             data = data.drop('adj close', axis=1)
 
-        # Ensure we have required columns
         required = ['open', 'high', 'low', 'close', 'volume']
         for col in required:
             if col not in data.columns:
                 raise ValueError(f"Missing required column: {col}")
 
-        # Add time column if index is datetime
         if isinstance(data.index, pd.DatetimeIndex):
             data['time'] = data.index
 
@@ -169,68 +167,56 @@ def fetch_data(symbol: str, days: int) -> pd.DataFrame:
 def generate_signals(
     df: pd.DataFrame,
     symbol: str,
-    calibration_pct: float = 0.2
+    calibration_pct: float = 0.1,  # Reduced calibration for more trading data
+    verbose: bool = False
 ) -> pd.Series:
     """
-    Generate trading signals using SignalGenerator.
+    Generate trading signals using Multi-Alpha SignalGenerator.
 
     Args:
         df: OHLCV DataFrame
         symbol: Trading symbol
-        calibration_pct: Percentage of data to use for calibration
+        calibration_pct: Percentage of data to use for calibration (reduced to 10%)
+        verbose: Print detailed signal info
 
     Returns:
         Series of signals (-1, 0, 1)
     """
-    # Split data
+    # Get trading params
+    params = get_params(symbol)
+
+    # Split data - use less for calibration, more for trading
     calibration_size = int(len(df) * calibration_pct)
-    calibration_df = df.iloc[:calibration_size].copy()
     trading_df = df.iloc[calibration_size:].copy()
 
-    logger.info(f"Calibrating on {calibration_size} bars, trading on {len(trading_df)} bars")
+    logger.info(f"Using {calibration_size} bars for warmup, trading on {len(trading_df)} bars")
 
-    # Initialize components
-    calibrator = MarketCalibrator(min_calibration_bars=50)  # Lower for backtesting
-    feature_engineer = FeatureEngineer()
-    regime_detector = RegimeDetector()
-
-    # Calibrate on first portion
-    try:
-        calibration_result = calibrator.calibrate_all(calibration_df)
-        logger.info(f"Calibration: regime={calibration_result.current_regime}, "
-                   f"fast={calibration_result.fast_period}, slow={calibration_result.slow_period}")
-    except Exception as e:
-        logger.warning(f"Calibration failed: {e}, using defaults")
-
-    # Initialize new institutional signal generator
-    signal_gen = SignalGenerator(min_confidence=0.5)
+    # Initialize new multi-alpha signal generator
+    # Lower confidence threshold for more trades
+    signal_gen = SignalGenerator(min_confidence=params.get('min_confidence', 0.40))
 
     # Generate signals for trading period
     signals = []
     entry_reasons = []
+    strategy_counts = {}
     errors = 0
 
-    # We need context - at least 100 bars for signal generator, prefer 200
-    # Use all available historical data up to window_size
+    # Context window - need at least 50 bars
     window_size = min(200, len(df) - 1)
-
-    min_context_bars = 60  # Minimum bars needed for signal generation
+    min_context_bars = 50
 
     for i in range(len(trading_df)):
-        # Get context window - include all available history up to current bar
         current_idx = calibration_size + i
         start_idx = max(0, current_idx - window_size)
         end_idx = current_idx + 1
         context_df = df.iloc[start_idx:end_idx].copy()
 
-        # Skip if not enough history yet
         if len(context_df) < min_context_bars:
             signals.append(0)
             entry_reasons.append("")
             continue
 
         try:
-            # New interface: generate_signal(df, symbol)
             signal = signal_gen.generate_signal(context_df, symbol)
 
             if signal.action == 'long':
@@ -240,13 +226,18 @@ def generate_signals(
             else:
                 signals.append(0)
 
-            # Track entry reasons
-            entry_reasons.append(signal.entry_reason if signal.entry_reason else signal.filter_reason)
+            # Track entry reasons and strategies
+            reason = signal.entry_reason if signal.entry_reason else "no_signal"
+            entry_reasons.append(reason)
 
-            # Debug first few signals
-            if i < 5:
-                logger.debug(f"Bar {i}: action={signal.action}, direction={signal.direction:.3f}, "
-                           f"confidence={signal.confidence:.3f}, reason={signal.entry_reason}")
+            if signal.primary_strategy and signal.action != 'neutral':
+                strategy_counts[signal.primary_strategy] = strategy_counts.get(signal.primary_strategy, 0) + 1
+
+            # Debug output
+            if verbose and i < 10 and signal.action != 'neutral':
+                logger.info(f"Bar {i}: {signal.action} | conf={signal.confidence:.2f} | "
+                           f"strategy={signal.primary_strategy} | reason={signal.entry_reason}")
+
         except Exception as e:
             errors += 1
             if errors <= 5:
@@ -260,10 +251,14 @@ def generate_signals(
     # Log entry reason distribution
     reason_counts = {}
     for reason in entry_reasons:
-        if reason:
+        if reason and reason != "no_signal":
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
     if reason_counts:
         logger.info(f"Entry reasons: {reason_counts}")
+
+    # Log strategy distribution
+    if strategy_counts:
+        logger.info(f"Strategy signals: {strategy_counts}")
 
     signal_series = pd.Series(signals, index=trading_df.index)
 
@@ -271,23 +266,28 @@ def generate_signals(
     long_signals = (signal_series == 1).sum()
     short_signals = (signal_series == -1).sum()
     neutral_signals = (signal_series == 0).sum()
+    total_signals = long_signals + short_signals
+
     logger.info(f"Signals: Long={long_signals}, Short={short_signals}, Neutral={neutral_signals}")
+    logger.info(f"Total entry signals: {total_signals}")
 
-    # Log blocking stats (CRITICAL - shows why signals were rejected)
-    blocked_stats = signal_gen.get_blocked_stats()
-    blocked_chasing = blocked_stats.get("chasing", 0)
-    blocked_pullback = blocked_stats.get("no_pullback", 0)
-    blocked_confirm = blocked_stats.get("no_confirmation", 0)
-    blocked_vol = blocked_stats.get("volatility", 0)
-    logger.info(f"Blocked: chasing={blocked_chasing}, no_pullback={blocked_pullback}, "
-               f"no_confirmation={blocked_confirm}, volatility={blocked_vol}")
+    # Calculate approximate trades per year
+    trading_days = len(trading_df)
+    if trading_days > 0:
+        signals_per_day = total_signals / trading_days
+        approx_trades_per_year = signals_per_day * 252
+        logger.info(f"Approximate trades/year: {approx_trades_per_year:.0f}")
 
-    # Calculate long/short ratio (CRITICAL for trend following)
+    # Long/short ratio
     if short_signals > 0:
         long_short_ratio = long_signals / short_signals
         logger.info(f"Long/Short Ratio: {long_short_ratio:.2f}")
     else:
         logger.info(f"Long/Short Ratio: N/A (no shorts)")
+
+    # Get signal stats from generator
+    stats = signal_gen.get_signal_stats()
+    logger.info(f"Signal generator stats: {stats}")
 
     return signal_series
 
@@ -301,9 +301,6 @@ def run_backtest(
     """
     Run vectorized backtest.
 
-    CRITICAL: Uses GUARDIAN threshold (1% below max) to simulate real trading
-    where we stop BEFORE hitting the actual limit.
-
     Args:
         df: OHLCV DataFrame (must match signals index)
         signals: Signal series (-1, 0, 1)
@@ -313,11 +310,9 @@ def run_backtest(
     Returns:
         BacktestResults
     """
-    # Align data with signals
     df_aligned = df.loc[signals.index].copy()
 
     # Use GUARDIAN threshold - stop 2.0% before actual limit
-    # This is critical for prop firm safety - gives buffer for slippage/volatility
     guardian_threshold = max_dd - 2.0  # 4.0% for 6% limit
     logger.info(f"Using guardian threshold: {guardian_threshold}% (actual limit: {max_dd}%)")
 
@@ -325,8 +320,8 @@ def run_backtest(
         initial_capital=capital,
         commission_pct=0.001,  # 0.1%
         slippage_pct=0.0005,  # 0.05%
-        max_drawdown_pct=guardian_threshold,  # GUARDIAN threshold, not actual limit
-        max_daily_loss_pct=guardian_threshold / 2,  # Half of guardian
+        max_drawdown_pct=guardian_threshold,
+        max_daily_loss_pct=guardian_threshold / 2,
     )
 
     backtester = VectorizedBacktester(config)
@@ -339,27 +334,16 @@ def check_prop_firm_safety(
     results: BacktestResults,
     max_dd: float
 ) -> Dict[str, Any]:
-    """
-    Check if strategy is safe for prop firm trading.
-
-    Args:
-        results: Backtest results
-        max_dd: Maximum allowed drawdown
-
-    Returns:
-        Safety analysis dict
-    """
-    guardian_threshold = max_dd * 0.85  # Guardian at 85% of limit
+    """Check if strategy is safe for prop firm trading."""
+    guardian_threshold = max_dd * 0.85
 
     analyzer = DrawdownAnalyzer(guardian_threshold_pct=guardian_threshold)
 
-    # Analyze drawdowns
     analysis = analyzer.analyze(
         equity_curve=results.equity_curve,
         trades=results.trades
     )
 
-    # Safety checks
     is_safe = results.max_drawdown < max_dd
     breached_guardian = results.max_drawdown >= guardian_threshold
 
@@ -375,46 +359,121 @@ def check_prop_firm_safety(
 
 
 def print_summary(results: BacktestResults, safety: Dict[str, Any], symbol: str):
-    """Print backtest summary to console."""
-    print("\n" + "=" * 60)
-    print(f"BACKTEST RESULTS: {symbol}")
-    print("=" * 60)
+    """Print backtest summary with multi-alpha specific metrics."""
+    print("\n" + "=" * 70)
+    print(f"  MULTI-ALPHA BACKTEST RESULTS: {symbol}")
+    print("=" * 70)
 
-    # Performance
-    print("\n📈 PERFORMANCE:")
-    print(f"  Total Return:     ${results.total_return:,.2f} ({results.total_return_pct:+.2f}%)")
-    print(f"  CAGR:             {results.cagr:.2f}%")
-    print(f"  Sharpe Ratio:     {results.sharpe_ratio:.2f}")
-    print(f"  Sortino Ratio:    {results.sortino_ratio:.2f}")
-    print(f"  Calmar Ratio:     {results.calmar_ratio:.2f}")
+    # Key metrics for Renaissance-style trading
+    print("\n🎯 TARGET vs ACTUAL:")
+    print("-" * 40)
+
+    # Trades
+    trades_target = 80
+    trades_icon = "✅" if results.total_trades >= trades_target else "❌"
+    print(f"  Trades:          {results.total_trades:>6} (target: {trades_target}+) {trades_icon}")
+
+    # Win rate
+    win_rate_target = 50
+    win_rate_icon = "✅" if results.win_rate >= win_rate_target else "❌"
+    print(f"  Win Rate:        {results.win_rate:>5.1f}% (target: {win_rate_target}%+) {win_rate_icon}")
+
+    # Avg Win / Avg Loss ratio
+    if results.avg_loser != 0:
+        win_loss_ratio = abs(results.avg_winner / results.avg_loser)
+    else:
+        win_loss_ratio = float('inf') if results.avg_winner > 0 else 0
+    rr_target = 2.0
+    rr_icon = "✅" if win_loss_ratio >= rr_target else "❌"
+    print(f"  Win/Loss Ratio:  {win_loss_ratio:>5.2f}x (target: {rr_target}x+) {rr_icon}")
+
+    # Return
+    return_target = 30
+    return_icon = "✅" if results.total_return_pct >= return_target else "❌"
+    print(f"  Total Return:    {results.total_return_pct:>+5.1f}% (target: +{return_target}%+) {return_icon}")
+
+    # Max DD
+    dd_target = 4.0
+    dd_icon = "✅" if results.max_drawdown <= dd_target else "❌"
+    print(f"  Max Drawdown:    {results.max_drawdown:>5.2f}% (limit: {dd_target}%) {dd_icon}")
+
+    # Sharpe
+    sharpe_target = 1.5
+    sharpe_icon = "✅" if results.sharpe_ratio >= sharpe_target else "❌"
+    print(f"  Sharpe Ratio:    {results.sharpe_ratio:>5.2f} (target: {sharpe_target}+) {sharpe_icon}")
+
+    # Detailed Performance
+    print("\n📈 DETAILED PERFORMANCE:")
+    print("-" * 40)
+    print(f"  Initial Capital: ${results.config.initial_capital:,.0f}")
+    print(f"  Final Equity:    ${results.config.initial_capital + results.total_return:,.0f}")
+    print(f"  Total Return:    ${results.total_return:,.2f} ({results.total_return_pct:+.2f}%)")
+    print(f"  CAGR:            {results.cagr:.2f}%")
+    print(f"  Sortino Ratio:   {results.sortino_ratio:.2f}")
+    print(f"  Calmar Ratio:    {results.calmar_ratio:.2f}")
+
+    # Trade Statistics
+    print("\n📊 TRADE STATISTICS:")
+    print("-" * 40)
+    print(f"  Total Trades:    {results.total_trades}")
+    print(f"  Winning Trades:  {int(results.total_trades * results.win_rate / 100)}")
+    print(f"  Losing Trades:   {int(results.total_trades * (100 - results.win_rate) / 100)}")
+    print(f"  Profit Factor:   {results.profit_factor:.2f}")
+    print(f"  Avg Trade PnL:   ${results.avg_trade_pnl:,.2f}")
+    print(f"  Avg Winner:      ${results.avg_winner:,.2f}")
+    print(f"  Avg Loser:       ${results.avg_loser:,.2f}")
+    print(f"  Largest Winner:  ${results.largest_winner:,.2f}")
+    print(f"  Largest Loser:   ${results.largest_loser:,.2f}")
+    print(f"  Avg Hold Time:   {results.avg_hold_time:.1f} bars")
 
     # Risk
-    print("\n⚠️  RISK:")
-    print(f"  Max Drawdown:     {results.max_drawdown:.2f}%")
-    print(f"  Max DD Duration:  {results.max_drawdown_duration} bars")
+    print("\n⚠️  RISK METRICS:")
+    print("-" * 40)
+    print(f"  Max Drawdown:    {results.max_drawdown:.2f}%")
+    print(f"  Max DD Duration: {results.max_drawdown_duration} bars")
 
     # Prop firm safety
     safety_icon = "✅" if safety['is_safe'] else "❌"
     print(f"\n{safety_icon} PROP FIRM SAFETY:")
-    print(f"  Max Allowed DD:   {safety['max_allowed']:.1f}%")
-    print(f"  Guardian Level:   {safety['guardian_threshold']:.1f}%")
-    print(f"  Safety Margin:    {safety['safety_margin']:.2f}%")
+    print("-" * 40)
+    print(f"  Max Allowed DD:  {safety['max_allowed']:.1f}%")
+    print(f"  Guardian Level:  {safety['guardian_threshold']:.1f}%")
+    print(f"  Safety Margin:   {safety['safety_margin']:.2f}%")
     if safety['breached_guardian']:
         print("  ⚠️  WARNING: Breached guardian threshold!")
 
-    # Trade stats
-    print("\n📊 TRADE STATISTICS:")
-    print(f"  Total Trades:     {results.total_trades}")
-    print(f"  Win Rate:         {results.win_rate:.1f}%")
-    print(f"  Profit Factor:    {results.profit_factor:.2f}")
-    print(f"  Avg Trade PnL:    ${results.avg_trade_pnl:,.2f}")
-    print(f"  Avg Winner:       ${results.avg_winner:,.2f}")
-    print(f"  Avg Loser:        ${results.avg_loser:,.2f}")
-    print(f"  Largest Winner:   ${results.largest_winner:,.2f}")
-    print(f"  Largest Loser:    ${results.largest_loser:,.2f}")
-    print(f"  Avg Hold Time:    {results.avg_hold_time:.1f} bars")
+    # Score
+    print("\n📋 RENAISSANCE SCORE:")
+    print("-" * 40)
+    score = 0
+    if results.total_trades >= trades_target:
+        score += 1
+    if results.win_rate >= win_rate_target:
+        score += 1
+    if win_loss_ratio >= rr_target:
+        score += 1
+    if results.total_return_pct >= return_target:
+        score += 1
+    if results.max_drawdown <= dd_target:
+        score += 1
+    if results.sharpe_ratio >= sharpe_target:
+        score += 1
 
-    print("\n" + "=" * 60)
+    score_icon = "🏆" if score >= 5 else "🔄" if score >= 3 else "❌"
+    print(f"  {score_icon} Score: {score}/6 targets met")
+
+    if score < 4:
+        print("\n  Recommendations:")
+        if results.total_trades < trades_target:
+            print("    - Lower signal thresholds to generate more trades")
+        if results.win_rate < win_rate_target:
+            print("    - Review entry criteria quality")
+        if win_loss_ratio < rr_target:
+            print("    - Improve stop/target ratios")
+        if results.max_drawdown > dd_target:
+            print("    - Reduce position sizes")
+
+    print("\n" + "=" * 70)
 
 
 def save_html_report(
@@ -424,11 +483,9 @@ def save_html_report(
     df: pd.DataFrame
 ):
     """Generate and save HTML tearsheet report."""
-    # Create reports directory if needed
     output_file = Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Generate tearsheet
     generator = TearsheetGenerator(
         guardian_threshold_pct=results.config.max_drawdown_pct * 0.85,
         max_drawdown_pct=results.config.max_drawdown_pct
@@ -439,13 +496,11 @@ def save_html_report(
         equity_curve=results.equity_curve,
         market_data=df,
         trades=results.trades,
-        strategy_name=f"{symbol} Strategy"
+        strategy_name=f"{symbol} Multi-Alpha Strategy"
     )
 
-    # Generate HTML
     html_content = generate_html_report(report)
 
-    # Save to file
     with open(output_file, 'w') as f:
         f.write(html_content)
 
@@ -455,18 +510,26 @@ def save_html_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run strategy backtest on historical data",
+        description="Run multi-alpha strategy backtest on historical data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    python scripts/run_backtest.py --symbol BTCUSD --days 365
+    python scripts/run_backtest.py --symbol BTCUSD --days 365 --verbose
     python scripts/run_backtest.py --symbol XAUUSD --days 730 --max-dd 8.5
-    python scripts/run_backtest.py --symbol NAS100 --days 365 --capital 50000 --output reports/nas100.html
+    python scripts/run_backtest.py --symbol NAS100 --days 365 --capital 50000
+
+Target Metrics (Renaissance-style):
+    - Trades per symbol: 80+
+    - Win Rate: 50-55%
+    - Avg Win / Avg Loss: >2.0
+    - Annual Return: >30%
+    - Max Drawdown: <4%
+    - Sharpe Ratio: >1.5
 
 Supported Symbols:
-    Crypto:  BTCUSD, ETHUSD, SOLUSD, XRPUSD, LTCUSD
+    Crypto:  BTCUSD, ETHUSD, SOLUSD
     Gold:    XAUUSD
-    Forex:   EURUSD, GBPUSD, USDJPY, AUDUSD
+    Forex:   EURUSD, GBPUSD
     Indices: NAS100, US30, SPX500
         """
     )
@@ -502,6 +565,11 @@ Supported Symbols:
         help='Path to save HTML report (optional)'
     )
     parser.add_argument(
+        '--verbose',
+        action='store_true',
+        help='Enable verbose logging (shows signal details)'
+    )
+    parser.add_argument(
         '--debug',
         action='store_true',
         help='Enable debug logging'
@@ -519,7 +587,7 @@ Supported Symbols:
     # Suppress yfinance noise
     logging.getLogger('yfinance').setLevel(logging.WARNING)
 
-    print(f"\n🚀 Running backtest for {args.symbol}")
+    print(f"\n🚀 Multi-Alpha Backtest: {args.symbol}")
     print(f"   Days: {args.days}, Capital: ${args.capital:,.0f}, Max DD: {args.max_dd}%\n")
 
     try:
@@ -528,8 +596,8 @@ Supported Symbols:
         df = fetch_data(args.symbol, args.days)
 
         # 2. Generate signals
-        print("🔮 Generating trading signals...")
-        signals = generate_signals(df, args.symbol)
+        print("🔮 Generating multi-alpha signals...")
+        signals = generate_signals(df, args.symbol, verbose=args.verbose)
 
         # 3. Run backtest
         print("⚡ Running backtest...")
@@ -551,7 +619,6 @@ Supported Symbols:
             print("\n📝 Generating HTML report...")
             save_html_report(results, args.symbol, args.output, df)
 
-        # Return exit code based on safety
         return 0 if safety['is_safe'] else 1
 
     except Exception as e:
