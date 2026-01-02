@@ -8,6 +8,13 @@ from .telegram_bot import (
     TelegramConfig,
     AlertLevel,
 )
+from .metrics.prometheus import (
+    MetricsRegistry,
+    MetricsServer,
+    TradingMetricsCollector,
+    get_metrics,
+    init_metrics_server
+)
 
 
 __all__ = [
@@ -15,4 +22,9 @@ __all__ = [
     'TelegramNotifier',
     'TelegramConfig',
     'AlertLevel',
+    'MetricsRegistry',
+    'MetricsServer',
+    'TradingMetricsCollector',
+    'get_metrics',
+    'init_metrics_server',
 ]

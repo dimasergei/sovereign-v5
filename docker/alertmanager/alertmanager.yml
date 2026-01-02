@@ -1,0 +1,146 @@
+# =============================================================================
+# ALERTMANAGER CONFIGURATION
+# =============================================================================
+# Alert routing and notification configuration
+
+global:
+  # SMTP configuration (for email alerts)
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'alerts@sovereign-trading.com'
+  smtp_auth_username: '${SMTP_USER}'
+  smtp_auth_password: '${SMTP_PASSWORD}'
+  
+  # Resolve timeout
+  resolve_timeout: 5m
+
+# Templates for notifications
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# Routing tree
+route:
+  # Default receiver
+  receiver: 'telegram-critical'
+  
+  # Group alerts by these labels
+  group_by: ['alertname', 'account', 'severity']
+  
+  # Wait before sending first notification
+  group_wait: 30s
+  
+  # Wait before sending updated notification
+  group_interval: 5m
+  
+  # Wait before resending notification
+  repeat_interval: 4h
+  
+  # Child routes
+  routes:
+    # Critical alerts - immediate notification
+    - match:
+        severity: critical
+      receiver: 'telegram-critical'
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: true
+
+    # Warning alerts
+    - match:
+        severity: warning
+      receiver: 'telegram-warning'
+      group_wait: 1m
+      repeat_interval: 4h
+      
+    # Info alerts - less urgent
+    - match:
+        severity: info
+      receiver: 'telegram-info'
+      group_wait: 5m
+      repeat_interval: 12h
+
+# Inhibition rules
+inhibit_rules:
+  # If critical alert is firing, inhibit warning
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'account']
+    
+  # If drawdown breach, inhibit other drawdown alerts
+  - source_match:
+      alertname: 'DrawdownBreach'
+    target_match_re:
+      alertname: 'Drawdown.*'
+    equal: ['account']
+
+# Receivers
+receivers:
+  # Critical alerts - Telegram with high priority
+  - name: 'telegram-critical'
+    telegram_configs:
+      - bot_token: '${TELEGRAM_BOT_TOKEN}'
+        chat_id: ${TELEGRAM_CHAT_ID}
+        parse_mode: 'HTML'
+        message: |
+          🚨 <b>CRITICAL ALERT</b> 🚨
+          
+          <b>Alert:</b> {{ .GroupLabels.alertname }}
+          <b>Account:</b> {{ .GroupLabels.account }}
+          <b>Severity:</b> {{ .GroupLabels.severity }}
+          
+          {{ range .Alerts }}
+          <b>Summary:</b> {{ .Annotations.summary }}
+          <b>Description:</b> {{ .Annotations.description }}
+          <b>Started:</b> {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ end }}
+          
+          ⚠️ Immediate action may be required!
+
+  # Warning alerts
+  - name: 'telegram-warning'
+    telegram_configs:
+      - bot_token: '${TELEGRAM_BOT_TOKEN}'
+        chat_id: ${TELEGRAM_CHAT_ID}
+        parse_mode: 'HTML'
+        message: |
+          ⚠️ <b>WARNING</b>
+          
+          <b>Alert:</b> {{ .GroupLabels.alertname }}
+          <b>Account:</b> {{ .GroupLabels.account }}
+          
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          {{ .Annotations.description }}
+          {{ end }}
+
+  # Info alerts
+  - name: 'telegram-info'
+    telegram_configs:
+      - bot_token: '${TELEGRAM_BOT_TOKEN}'
+        chat_id: ${TELEGRAM_CHAT_ID}
+        parse_mode: 'HTML'
+        message: |
+          ℹ️ <b>INFO</b>
+          
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}
+          {{ end }}
+
+  # Email for critical (backup)
+  - name: 'email-critical'
+    email_configs:
+      - to: '${ALERT_EMAIL}'
+        send_resolved: true
+        headers:
+          Subject: '[SOVEREIGN CRITICAL] {{ .GroupLabels.alertname }}'
+        html: |
+          <h2>Critical Alert</h2>
+          <p><strong>Alert:</strong> {{ .GroupLabels.alertname }}</p>
+          <p><strong>Account:</strong> {{ .GroupLabels.account }}</p>
+          {{ range .Alerts }}
+          <p>{{ .Annotations.description }}</p>
+          {{ end }}
+
+  # Null receiver (for silencing)
+  - name: 'null'
