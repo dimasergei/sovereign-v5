@@ -23,6 +23,27 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Symbol-specific size multipliers based on Sharpe ratio performance
+# More conservative to avoid guardian triggers
+SYMBOL_SIZE_MULTIPLIER = {
+    'XAUUSD': 1.2,   # Sharpe 2.70 - increase size 20%
+    'NAS100': 1.15,  # Sharpe 1.54 - increase size 15%
+    'EURUSD': 1.0,   # Sharpe 0.90 - keep normal
+    'BTCUSD': 0.7,   # Sharpe 0.19 - REDUCE size 30%
+}
+
+
+def get_size_multiplier(symbol: str) -> float:
+    """Get position size multiplier based on symbol's historical Sharpe."""
+    if not symbol:
+        return 1.0
+    clean = symbol.upper().replace('.X', '').replace('-', '')
+    for key, mult in SYMBOL_SIZE_MULTIPLIER.items():
+        if key in clean:
+            return mult
+    return 1.0
+
+
 class PositionStatus(Enum):
     OPEN = "open"
     CLOSED_STOP = "closed_stop"
@@ -180,12 +201,13 @@ class EventDrivenBacktester:
                 context_df = df.iloc[:i+1]
                 signal = signal_generator.generate_signal(context_df, symbol)
 
-                if signal.action != "neutral" and signal.confidence >= 0.35:
+                if signal.action != "neutral" and signal.confidence >= 0.40:
                     self._open_position(
                         bar=current_bar,
                         price=current_price,
                         signal=signal,
-                        atr=current_atr
+                        atr=current_atr,
+                        symbol=symbol
                     )
 
             # Step 4: Update equity curve
@@ -306,7 +328,7 @@ class EventDrivenBacktester:
             if pos.trailing_stop is None or new_trail < pos.trailing_stop:
                 pos.trailing_stop = new_trail
 
-    def _open_position(self, bar: int, price: float, signal, atr: float):
+    def _open_position(self, bar: int, price: float, signal, atr: float, symbol: str = None):
         """Open a new position."""
 
         # Calculate position size based on risk
@@ -317,9 +339,10 @@ class EventDrivenBacktester:
 
         stop_distance_pct = (stop_distance / price) * 100
 
-        # Risk amount
+        # Risk amount with symbol-specific multiplier
         position_size_scalar = getattr(signal, 'position_scalar', 1.0)
-        risk_pct = self.base_risk_pct * signal.confidence * position_size_scalar
+        size_mult = get_size_multiplier(symbol)
+        risk_pct = self.base_risk_pct * signal.confidence * position_size_scalar * size_mult
         risk_amount = self.equity * (risk_pct / 100)
 
         # Position size

@@ -19,6 +19,27 @@ from config.trading_params import get_params
 logger = logging.getLogger(__name__)
 
 
+# Symbol-specific size multipliers based on Sharpe ratio performance
+# More conservative to avoid guardian triggers
+SYMBOL_SIZE_MULTIPLIER = {
+    'XAUUSD': 1.2,   # Sharpe 2.70 - increase size 20%
+    'NAS100': 1.15,  # Sharpe 1.54 - increase size 15%
+    'EURUSD': 1.0,   # Sharpe 0.90 - keep normal
+    'BTCUSD': 0.7,   # Sharpe 0.19 - REDUCE size 30%
+}
+
+
+def get_size_multiplier(symbol: str) -> float:
+    """Get position size multiplier based on symbol's historical Sharpe."""
+    if not symbol:
+        return 1.0
+    clean = symbol.upper().replace('.X', '').replace('-', '')
+    for key, mult in SYMBOL_SIZE_MULTIPLIER.items():
+        if key in clean:
+            return mult
+    return 1.0
+
+
 @dataclass
 class PositionSize:
     """Position sizing result."""
@@ -151,6 +172,10 @@ class PositionSizer:
 
         # Apply signal confidence and position size from multi-alpha
         risk_pct *= signal_confidence * signal_position_size
+
+        # Apply symbol-specific size multiplier
+        size_mult = get_size_multiplier(symbol)
+        risk_pct *= size_mult
 
         # Cap at limits
         max_risk = params.get('max_risk_pct', self.max_risk_pct)
