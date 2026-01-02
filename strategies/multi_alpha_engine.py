@@ -178,14 +178,13 @@ class MultiAlphaEngine:
 
     def _mean_reversion_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
         """
-        Mean reversion strategy.
+        Mean reversion strategy with TREND BIAS OVERRIDE.
+
+        CRITICAL FIX: In strong uptrends, BLOCK short mean reversion signals.
+        This prevents shorting overbought conditions in bull markets.
 
         Edge: Overextended moves tend to snap back.
         Entry: Price far from mean with reversal signs.
-        This is HIGH FREQUENCY - trade more often.
-
-        Key change: Z-score threshold lowered from -2.0 to -1.5
-        RSI thresholds: 35/65 instead of 30/70
         """
         close = df['close'].values
         high = df['high'].values
@@ -193,6 +192,12 @@ class MultiAlphaEngine:
 
         if len(close) < 30:
             return None
+
+        # CRITICAL: Calculate trend for bias override
+        ema50 = self._ema(close, 50)
+        ema50_prev = self._ema(close[:-10], 50) if len(close) > 60 else ema50
+        trend_up = close[-1] > ema50 and close[-10] > ema50_prev
+        trend_down = close[-1] < ema50 and close[-10] < ema50_prev
 
         # Multiple timeframe mean reversion
         # Short-term (fast mean reversion)
@@ -211,11 +216,14 @@ class MultiAlphaEngine:
         # ATR
         atr = self._atr(high, low, close, 14)
 
-        # LONG: Oversold on short timeframe
-        # Less restrictive - z-score of -1.5 is enough (was -2.0)
-        # RSI threshold 35 instead of 30
+        # LONG: Oversold on short timeframe - ALLOW even in downtrend (catching bounces)
         if zscore_10 < -1.5 and rsi < 35:
             confidence = min(0.70, 0.45 + abs(zscore_10) * 0.1)
+
+            # Boost confidence in uptrend (buying dips in bull market)
+            if trend_up:
+                confidence = min(0.80, confidence + 0.10)
+
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
                 direction=1.0,
@@ -227,9 +235,20 @@ class MultiAlphaEngine:
             )
 
         # SHORT: Overbought on short timeframe
-        # RSI threshold 65 instead of 70
+        # CRITICAL: Block short signals in strong uptrend!
         if zscore_10 > 1.5 and rsi > 65:
+            # DON'T SHORT IN UPTREND - this was killing BTCUSD performance
+            if trend_up:
+                return None  # Skip this signal entirely
+
             confidence = min(0.70, 0.45 + abs(zscore_10) * 0.1)
+
+            # Only take with good confidence in downtrend
+            if trend_down:
+                confidence = min(0.75, confidence + 0.05)
+            else:
+                confidence *= 0.8  # Reduce confidence in neutral trend
+
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
                 direction=-1.0,
@@ -243,6 +262,9 @@ class MultiAlphaEngine:
         # MEDIUM-TERM mean reversion (less frequent but higher conviction)
         if zscore_20 < -2.0 and zscore_10 < -1.0:
             confidence = 0.65
+            if trend_up:
+                confidence = min(0.75, confidence + 0.10)
+
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
                 direction=1.0,
@@ -253,8 +275,15 @@ class MultiAlphaEngine:
                 entry_reason="mean_reversion_deep_oversold"
             )
 
+        # Deep overbought - still block in uptrend
         if zscore_20 > 2.0 and zscore_10 > 1.0:
+            if trend_up:
+                return None  # Don't short in uptrend
+
             confidence = 0.65
+            if trend_down:
+                confidence = min(0.70, confidence + 0.05)
+
             return AlphaSignal(
                 strategy=StrategyType.MEAN_REVERSION,
                 direction=-1.0,
@@ -269,47 +298,57 @@ class MultiAlphaEngine:
 
     def _breakout_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
         """
-        Breakout strategy.
+        Breakout strategy with TIGHTER PARAMETERS.
+
+        FIX: Reduced lookback from 20 to 10 bars for more signals.
+        Also added momentum confirmation for higher quality.
 
         Edge: Volatility expansion after compression often continues.
         Entry: Break of recent range with momentum.
-        Lower frequency but higher R:R.
         """
         close = df['close'].values
         high = df['high'].values
         low = df['low'].values
 
-        if len(close) < 30:
+        if len(close) < 20:
             return None
 
-        # Recent range (20 bars)
-        range_high = max(high[-20:])
-        range_low = min(low[-20:])
+        # CHANGED: 10-bar range instead of 20 for more triggers
+        lookback = 10
+        range_high = max(high[-lookback:])
+        range_low = min(low[-lookback:])
         range_size = (range_high - range_low) / range_low * 100
 
-        # Volatility compression (ATR contraction)
-        atr_current = self._atr(high[-14:], low[-14:], close[-14:], 14)
-        atr_prior = self._atr(high[-28:-14], low[-28:-14], close[-28:-14], 14) if len(high) >= 28 else atr_current
+        # Volatility compression (ATR contraction) - slightly looser threshold
+        atr_current = self._atr(high[-10:], low[-10:], close[-10:], 10)
+        atr_prior = self._atr(high[-20:-10], low[-20:-10], close[-20:-10], 10) if len(high) >= 20 else atr_current
 
-        vol_compression = atr_current < atr_prior * 0.8
+        vol_compression = atr_current < atr_prior * 0.85  # Was 0.8
 
         # Current price position
         current = close[-1]
         prev = close[-2]
 
+        # Momentum confirmation
+        momentum = (current - close[-5]) / close[-5] * 100 if len(close) >= 5 else 0
+
         # LONG breakout
         if current > range_high and prev <= range_high:
             confidence = 0.55
             if vol_compression:
-                confidence += 0.10  # Higher conviction after compression
+                confidence += 0.12  # Boost for compression breakout
+
+            # Additional boost if breaking with momentum
+            if momentum > 1.0:
+                confidence += 0.08
 
             return AlphaSignal(
                 strategy=StrategyType.BREAKOUT,
                 direction=1.0,
-                confidence=confidence,
-                expected_move=range_size * 0.5,  # Target: 50% of range added
-                holding_period=15,
-                stop_distance=2.0,  # Wider stop for breakouts
+                confidence=min(0.80, confidence),
+                expected_move=range_size * 0.6,  # Target: 60% of range added
+                holding_period=12,
+                stop_distance=1.5,  # Tighter stop than before
                 entry_reason="range_breakout_long"
             )
 
@@ -317,15 +356,19 @@ class MultiAlphaEngine:
         if current < range_low and prev >= range_low:
             confidence = 0.55
             if vol_compression:
-                confidence += 0.10
+                confidence += 0.12
+
+            # Boost for momentum breakdown
+            if momentum < -1.0:
+                confidence += 0.08
 
             return AlphaSignal(
                 strategy=StrategyType.BREAKOUT,
                 direction=-1.0,
-                confidence=confidence,
-                expected_move=range_size * 0.5,
-                holding_period=15,
-                stop_distance=2.0,
+                confidence=min(0.80, confidence),
+                expected_move=range_size * 0.6,
+                holding_period=12,
+                stop_distance=1.5,
                 entry_reason="range_breakdown_short"
             )
 
