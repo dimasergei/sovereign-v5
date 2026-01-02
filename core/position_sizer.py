@@ -40,11 +40,11 @@ class PositionSizer:
 
     def __init__(
         self,
-        base_risk_pct: float = 0.5,  # 0.5% per trade (was 1.0%)
-        max_risk_pct: float = 0.8,   # Max 0.8% even with high confidence
+        base_risk_pct: float = 0.75,  # Increased from 0.5 to use DD headroom
+        max_risk_pct: float = 1.0,    # Increased from 0.8
         min_risk_pct: float = 0.2,   # Min 0.2%
         max_positions: int = 6,      # Allow up to 6 simultaneous positions
-        max_total_risk: float = 3.0  # Max 3% total exposure
+        max_total_risk: float = 4.5  # Increased from 3.0
     ):
         """
         Initialize position sizer.

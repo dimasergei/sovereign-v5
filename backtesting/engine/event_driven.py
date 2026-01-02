@@ -95,13 +95,13 @@ class EventDrivenBacktester:
         self,
         initial_capital: float = 10000.0,
         max_drawdown_pct: float = 6.0,
-        guardian_buffer_pct: float = 2.0,  # Stop at 4% to avoid 6%
-        base_risk_pct: float = 0.5,
+        guardian_buffer_pct: float = 1.0,  # Stop at 5% to avoid 6% (was 2.0)
+        base_risk_pct: float = 0.75,       # Increased from 0.5
         max_positions: int = 4,
         use_trailing_stops: bool = True,
-        breakeven_trigger_r: float = 1.0,
-        trail_trigger_r: float = 1.5,
-        trail_distance_atr: float = 2.0
+        breakeven_trigger_r: float = 0.8,  # Was 1.0 - tighter
+        trail_trigger_r: float = 1.2,      # Was 1.5 - tighter
+        trail_distance_atr: float = 1.5    # Was 2.0 - tighter
     ):
         self.initial_capital = initial_capital
         self.max_drawdown_pct = max_drawdown_pct
@@ -180,7 +180,7 @@ class EventDrivenBacktester:
                 context_df = df.iloc[:i+1]
                 signal = signal_generator.generate_signal(context_df, symbol)
 
-                if signal.action != "neutral" and signal.confidence >= 0.4:
+                if signal.action != "neutral" and signal.confidence >= 0.35:
                     self._open_position(
                         bar=current_bar,
                         price=current_price,
