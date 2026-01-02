@@ -83,6 +83,10 @@ class BaseTradingBot(ABC):
         # State
         self.is_running = False
         self.is_paused = False
+
+        # Paper mode flag (can be set by subclasses before calling super().__init__)
+        if not hasattr(self, 'paper_mode'):
+            self.paper_mode = False
         
         # Components (initialized in start())
         self.connector: Optional[MT5Connector] = None
@@ -174,21 +178,36 @@ class BaseTradingBot(ABC):
     def _init_risk_manager(self):
         """Initialize risk management."""
         logger.info("Initializing risk manager...")
-        
+
         # Load existing state or create new
         state = RiskManager.load_state(self.state_file)
-        
+
         if state is None:
-            account_info = self.connector.get_account_info()
-            state = AccountRiskState(
-                initial_balance=self.firm_rules.initial_balance,
-                highest_balance=account_info['balance'],
-                current_balance=account_info['balance'],
-                current_equity=account_info['equity'],
-                daily_starting_balance=account_info['balance'],
-                daily_pnl=0.0,
-                daily_date=date.today().isoformat(),
-            )
+            # In paper mode, use simulated values from config
+            if self.paper_mode:
+                initial_balance = self.firm_rules.initial_balance
+                logger.info(f"PAPER MODE: Initializing with simulated balance ${initial_balance:.2f}")
+                state = AccountRiskState(
+                    initial_balance=initial_balance,
+                    highest_balance=initial_balance,
+                    current_balance=initial_balance,
+                    current_equity=initial_balance,
+                    daily_starting_balance=initial_balance,
+                    daily_pnl=0.0,
+                    daily_date=date.today().isoformat(),
+                )
+            else:
+                # Live mode - get actual account info
+                account_info = self.connector.get_account_info()
+                state = AccountRiskState(
+                    initial_balance=self.firm_rules.initial_balance,
+                    highest_balance=account_info['balance'],
+                    current_balance=account_info['balance'],
+                    current_equity=account_info['equity'],
+                    daily_starting_balance=account_info['balance'],
+                    daily_pnl=0.0,
+                    daily_date=date.today().isoformat(),
+                )
         
         self.risk_manager = RiskManager(
             rules=self.firm_rules,
@@ -329,22 +348,26 @@ class BaseTradingBot(ABC):
     
     def _update_account_state(self) -> bool:
         """Update account state from MT5."""
+        # Paper mode should be handled by subclass override
+        if self.paper_mode or not self.connector:
+            return True
+
         if not self.connector.ensure_connected():
             return False
-        
+
         account_info = self.connector.get_account_info()
         if not account_info:
             return False
-        
+
         risk_status = self.risk_manager.update_account_state(
             balance=account_info['balance'],
             equity=account_info['equity']
         )
-        
+
         # Check for violations
         if risk_status.get('violations'):
             logger.warning(f"Risk violations: {risk_status['violations']}")
-        
+
         return True
     
     def _analyze_and_trade(self, symbol: str):
@@ -459,8 +482,12 @@ class BaseTradingBot(ABC):
     
     def _manage_positions(self):
         """Manage existing positions (trailing stops, etc)."""
+        # Skip in paper mode - no real positions to manage
+        if self.paper_mode or not self.connector:
+            return
+
         positions = self.connector.get_positions()
-        
+
         for pos in positions:
             try:
                 self._manage_single_position(pos)
