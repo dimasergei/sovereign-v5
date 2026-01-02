@@ -1,5 +1,8 @@
 """
 Signal Generator - Combines all signal sources into trading decisions.
+
+CRITICAL: Now includes TrendFilter to prevent counter-trend trades.
+This is the #1 fix for preventing drawdowns.
 """
 
 import logging
@@ -12,6 +15,7 @@ import pandas as pd
 from core.lossless import MarketCalibrator, FullCalibrationResult
 from data import FeatureEngineer
 from models import EnsembleMetaLearner, RegimeDetector, EnsemblePrediction
+from signals.trend_filter import TrendFilter, TrendState, TrendDirection
 
 
 logger = logging.getLogger(__name__)
@@ -25,20 +29,27 @@ class TradingSignal:
     direction: float  # -1 to 1
     confidence: float  # 0 to 1
     position_scalar: float  # 0 to 1
-    
+
     # Risk parameters (derived from calibrator)
     stop_loss_atr_mult: float
     take_profit_atr_mult: float
-    
+
     # Context
     regime: str
     model_agreement: float
-    
+
+    # Trend filter fields (CRITICAL FOR COUNTER-TREND PREVENTION)
+    trend_direction: str = "neutral"  # strong_up, mild_up, neutral, mild_down, strong_down
+    trend_strength: float = 0.0  # 0-1
+    higher_tf_aligned: bool = False
+    filter_reason: str = ""  # Why signal was filtered
+    filters_applied: List[str] = field(default_factory=list)
+
     # Metadata
     timestamp: datetime = field(default_factory=datetime.now)
     calibration_confidence: float = 0.0
     contributing_models: List[str] = field(default_factory=list)
-    
+
     # Raw values for order placement
     current_price: float = 0.0
     atr: float = 0.0
@@ -91,7 +102,7 @@ class SignalGenerator:
     ):
         """
         Initialize signal generator.
-        
+
         Args:
             calibrator: MarketCalibrator for parameter derivation
             feature_engineer: FeatureEngineer for indicator calculation
@@ -106,7 +117,15 @@ class SignalGenerator:
         self.regime_detector = regime_detector or RegimeDetector()
         self.min_confidence = min_confidence
         self.recalibrate_hours = recalibrate_hours
-        
+
+        # CRITICAL: Add trend filter to prevent counter-trend trades
+        self.trend_filter = TrendFilter()
+        self.min_confidence_trending = 0.4  # Lower threshold in trends
+        self.min_confidence_ranging = 0.6   # Higher threshold in ranges
+
+        # Track blocked signals for monitoring
+        self.blocked_signals = {"counter_trend": 0, "low_confidence": 0}
+
         # Cache
         self._calibration_cache: Dict[str, FullCalibrationResult] = {}
         self._last_calibration: Dict[str, datetime] = {}
@@ -119,32 +138,37 @@ class SignalGenerator:
     ) -> TradingSignal:
         """
         Generate complete trading signal for a symbol.
-        
+
+        CRITICAL: Now applies trend filter to prevent counter-trend trades.
+
         Args:
             symbol: Trading symbol
             df: OHLCV DataFrame
             alt_data: Optional alternative data signals
-            
+
         Returns:
             TradingSignal with action, confidence, and risk parameters
         """
         if len(df) < 100:
             return self._neutral_signal(symbol, "Insufficient data")
-        
+
         # 1. Calibrate parameters if needed
         calibration = self._get_calibration(symbol, df)
-        
+
         # 2. Add features
         if self.feature_engineer:
             df = self.feature_engineer.add_all_features(df)
-        
+
         # 3. Detect regime
         regime, regime_prob = self.regime_detector.detect_regime(df['close'].values)
-        
-        # 4. Prepare features for models
+
+        # 4. CRITICAL: Analyze trend BEFORE generating signal
+        trend_state = self.trend_filter.analyze(df)
+
+        # 5. Prepare features for models
         features = self._prepare_features(df, alt_data)
-        
-        # 5. Get ensemble prediction (if available)
+
+        # 6. Get ensemble prediction (if available)
         if self.ensemble:
             try:
                 ensemble_pred = self.ensemble.predict(features)
@@ -153,9 +177,9 @@ class SignalGenerator:
                 ensemble_pred = None
         else:
             ensemble_pred = None
-        
-        # 6. Combine signals
-        signal = self._combine_signals(
+
+        # 7. Combine signals to get raw signal
+        raw_signal = self._combine_signals(
             symbol=symbol,
             df=df,
             calibration=calibration,
@@ -163,11 +187,79 @@ class SignalGenerator:
             ensemble_pred=ensemble_pred,
             alt_data=alt_data
         )
-        
-        # 7. Apply regime filter
-        signal = self._apply_regime_filter(signal, regime)
-        
-        return signal
+
+        # 8. Apply regime filter (existing)
+        raw_signal = self._apply_regime_filter(raw_signal, regime)
+
+        # 9. CRITICAL: Apply trend filter - THIS IS THE KEY FIX
+        filtered_action, conf_mult, filter_reason = self.trend_filter.filter_signal(
+            raw_signal.action,
+            trend_state,
+            regime
+        )
+
+        # Track blocked signals
+        if filter_reason == "counter_trend_blocked":
+            self.blocked_signals["counter_trend"] += 1
+            logger.info(f"BLOCKED {raw_signal.action.upper()} on {symbol} - "
+                       f"counter-trend in {trend_state.direction.value}")
+
+        # Adjust confidence threshold based on regime
+        if trend_state.is_trending:
+            min_conf = self.min_confidence_trending
+        else:
+            min_conf = self.min_confidence_ranging
+
+        # Apply confidence adjustment
+        adjusted_confidence = raw_signal.confidence * conf_mult
+
+        # Final decision
+        if filtered_action == "neutral" or adjusted_confidence < min_conf:
+            if raw_signal.action != "neutral" and adjusted_confidence < min_conf:
+                self.blocked_signals["low_confidence"] += 1
+
+            return TradingSignal(
+                symbol=symbol,
+                action="neutral",
+                direction=0.0,
+                confidence=0.0,
+                position_scalar=0.0,
+                stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
+                take_profit_atr_mult=calibration.take_profit_atr_multiple,
+                regime=regime,
+                model_agreement=raw_signal.model_agreement,
+                trend_direction=trend_state.direction.value,
+                trend_strength=trend_state.strength,
+                higher_tf_aligned=trend_state.higher_tf_aligned,
+                filter_reason=filter_reason,
+                filters_applied=["trend_filter"],
+                calibration_confidence=calibration.confidence,
+                contributing_models=raw_signal.contributing_models,
+                current_price=raw_signal.current_price,
+                atr=raw_signal.atr,
+            )
+
+        # Return filtered signal with trend info
+        return TradingSignal(
+            symbol=symbol,
+            action=filtered_action,
+            direction=raw_signal.direction,
+            confidence=adjusted_confidence,
+            position_scalar=raw_signal.position_scalar * conf_mult,
+            stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
+            take_profit_atr_mult=calibration.take_profit_atr_multiple,
+            regime=regime,
+            model_agreement=raw_signal.model_agreement,
+            trend_direction=trend_state.direction.value,
+            trend_strength=trend_state.strength,
+            higher_tf_aligned=trend_state.higher_tf_aligned,
+            filter_reason=filter_reason,
+            filters_applied=["trend_filter"],
+            calibration_confidence=calibration.confidence,
+            contributing_models=raw_signal.contributing_models,
+            current_price=raw_signal.current_price,
+            atr=raw_signal.atr,
+        )
     
     def _get_calibration(
         self,

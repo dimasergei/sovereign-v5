@@ -408,7 +408,161 @@ class RiskManager:
             return False, ViolationType.TRADE_RISK_TOO_HIGH, error_msg
 
         return True, None, "Trade validated"
-    
+
+    def pre_trade_check(self, proposed_trade: dict) -> Tuple[bool, str]:
+        """
+        MANDATORY check before ANY trade is placed.
+
+        This is the guardian system that BLOCKS trades before they can breach limits.
+        Called by bots before executing any trade.
+
+        Args:
+            proposed_trade: Dict with symbol, direction, size, risk_amount, stop_loss_pct
+
+        Returns:
+            Tuple of (allowed: bool, reason: str)
+        """
+        # Check 1: Account locked
+        if self.state.is_locked:
+            return False, f"BLOCKED: Account locked - {self.state.lock_reason}"
+
+        # Check 2: Current drawdown proximity to limit
+        current_dd = self.get_current_drawdown_pct()
+        guardian_buffer = 1.5  # Stay 1.5% away from max
+
+        guardian_threshold = self.rules.max_overall_drawdown_pct - guardian_buffer
+        if current_dd >= guardian_threshold:
+            return False, f"BLOCKED: DD {current_dd:.2f}% too close to limit {self.rules.max_overall_drawdown_pct}%"
+
+        # Check 3: Daily loss proximity to limit (if applicable)
+        if self.rules.max_daily_loss_pct:
+            daily_loss = self.get_daily_loss_pct()
+            daily_guardian = self.rules.max_daily_loss_pct - 1.0  # 1% buffer
+
+            if daily_loss >= daily_guardian:
+                return False, f"BLOCKED: Daily loss {daily_loss:.2f}% too close to limit {self.rules.max_daily_loss_pct}%"
+
+        # Check 4: Projected loss if trade goes to stop loss
+        risk_amount = proposed_trade.get('risk_amount', 0)
+        account_balance = self.state.current_balance
+
+        if account_balance > 0 and risk_amount > 0:
+            risk_pct = (risk_amount / account_balance) * 100
+            max_per_trade_risk = 1.0  # Max 1% per trade (conservative)
+
+            if risk_pct > max_per_trade_risk:
+                return False, f"BLOCKED: Trade risk {risk_pct:.2f}% exceeds max {max_per_trade_risk}%"
+
+        # Check 5: Projected DD if trade loses fully
+        if self.state.highest_balance > 0 and risk_amount > 0:
+            projected_dd = current_dd + (risk_amount / self.state.highest_balance * 100)
+
+            if projected_dd >= self.rules.max_overall_drawdown_pct:
+                return False, f"BLOCKED: Projected DD {projected_dd:.2f}% would breach limit {self.rules.max_overall_drawdown_pct}%"
+
+        # Check 6: Position correlation/concentration
+        if self._would_exceed_concentration_limit(proposed_trade):
+            return False, "BLOCKED: Would exceed concentration/correlation limit"
+
+        return True, "APPROVED"
+
+    def calculate_safe_position_size(
+        self,
+        symbol: str,
+        stop_loss_pct: float,
+        signal_confidence: float = 0.5
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Calculate position size that CANNOT breach limits.
+
+        Uses multiple constraints and takes the minimum.
+
+        Args:
+            symbol: Trading symbol
+            stop_loss_pct: Stop loss distance as percentage
+            signal_confidence: Signal confidence 0-1
+
+        Returns:
+            Tuple of (risk_amount, details_dict)
+        """
+        account_balance = self.state.current_balance
+        current_dd = self.get_current_drawdown_pct()
+        guardian_buffer = 1.5
+
+        # Constraint 1: Max risk per trade (1% conservative)
+        max_risk = account_balance * 0.01
+
+        # Constraint 2: Can't push DD past guardian
+        remaining_dd_room = (self.rules.max_overall_drawdown_pct - guardian_buffer - current_dd) / 100
+        max_risk_from_dd = self.state.highest_balance * max(0, remaining_dd_room)
+
+        # Constraint 3: Daily limit (if applicable)
+        if self.rules.max_daily_loss_pct:
+            daily_loss = self.get_daily_loss_pct()
+            daily_guardian = 1.0  # 1% buffer
+            remaining_daily = (self.rules.max_daily_loss_pct - daily_guardian - daily_loss) / 100
+            max_risk_from_daily = account_balance * max(0, remaining_daily)
+        else:
+            max_risk_from_daily = float('inf')
+
+        # Take minimum of all constraints
+        safe_risk = min(max_risk, max_risk_from_dd, max_risk_from_daily)
+        safe_risk = max(0, safe_risk)  # Never negative
+
+        # Apply confidence scaling
+        safe_risk *= (0.5 + signal_confidence * 0.5)
+
+        # Convert risk to position size
+        if stop_loss_pct > 0:
+            position_size = safe_risk / (stop_loss_pct / 100)
+        else:
+            position_size = 0
+
+        details = {
+            "safe_risk_amount": safe_risk,
+            "position_size": position_size,
+            "max_risk_per_trade": max_risk,
+            "max_risk_from_dd": max_risk_from_dd,
+            "max_risk_from_daily": max_risk_from_daily if max_risk_from_daily != float('inf') else None,
+            "current_dd_pct": current_dd,
+            "remaining_dd_room_pct": remaining_dd_room * 100,
+        }
+
+        return safe_risk, details
+
+    def _would_exceed_concentration_limit(self, proposed_trade: dict) -> bool:
+        """Check if trade would create dangerous concentration."""
+        try:
+            positions = mt5.positions_get()
+            if not positions:
+                return False
+
+            proposed_direction = proposed_trade.get('direction', 'long')
+
+            # Check same-direction concentration
+            same_direction_count = sum(
+                1 for p in positions
+                if (p.type == mt5.POSITION_TYPE_BUY and proposed_direction == 'long') or
+                   (p.type == mt5.POSITION_TYPE_SELL and proposed_direction == 'short')
+            )
+
+            # Max 3 positions in same direction
+            if same_direction_count >= 3:
+                return True
+
+            # Check total exposure
+            total_risk = sum(abs(p.profit) if p.profit < 0 else 0 for p in positions)
+            total_risk += proposed_trade.get('risk_amount', 0)
+
+            if self.state.current_balance > 0:
+                total_risk_pct = (total_risk / self.state.current_balance) * 100
+                if total_risk_pct > 3.0:  # Max 3% total risk across all positions
+                    return True
+
+            return False
+        except Exception:
+            return False
+
     def record_trade_result(self, pnl: float, is_winner: bool):
         """
         Record trade result for statistics and Kelly calculation.

@@ -45,6 +45,7 @@ from core.lossless import MarketCalibrator
 from data import FeatureEngineer
 from models import RegimeDetector, EnsembleMetaLearner
 from signals.generator import SignalGenerator, TradingSignal
+from signals.trend_filter import TrendFilter, TrendDirection
 
 
 # Symbol mappings to Yahoo Finance tickers
@@ -262,6 +263,19 @@ def generate_signals(
     neutral_signals = (signal_series == 0).sum()
     logger.info(f"Signals: Long={long_signals}, Short={short_signals}, Neutral={neutral_signals}")
 
+    # Log trend filter stats (CRITICAL - this shows counter-trend prevention)
+    blocked_counter_trend = signal_gen.blocked_signals.get("counter_trend", 0)
+    blocked_low_conf = signal_gen.blocked_signals.get("low_confidence", 0)
+    logger.info(f"Trend Filter: Blocked {blocked_counter_trend} counter-trend signals, "
+               f"{blocked_low_conf} low-confidence signals")
+
+    # Calculate long/short ratio (CRITICAL for trend following)
+    if short_signals > 0:
+        long_short_ratio = long_signals / short_signals
+        logger.info(f"Long/Short Ratio: {long_short_ratio:.2f}")
+    else:
+        logger.info(f"Long/Short Ratio: N/A (no shorts)")
+
     return signal_series
 
 
@@ -274,11 +288,14 @@ def run_backtest(
     """
     Run vectorized backtest.
 
+    CRITICAL: Uses GUARDIAN threshold (1% below max) to simulate real trading
+    where we stop BEFORE hitting the actual limit.
+
     Args:
         df: OHLCV DataFrame (must match signals index)
         signals: Signal series (-1, 0, 1)
         capital: Initial capital
-        max_dd: Maximum drawdown limit
+        max_dd: Maximum drawdown limit (actual firm limit)
 
     Returns:
         BacktestResults
@@ -286,12 +303,17 @@ def run_backtest(
     # Align data with signals
     df_aligned = df.loc[signals.index].copy()
 
+    # Use GUARDIAN threshold - stop 1% before actual limit
+    # This is critical for prop firm safety
+    guardian_threshold = max_dd - 1.0
+    logger.info(f"Using guardian threshold: {guardian_threshold}% (actual limit: {max_dd}%)")
+
     config = BacktestConfig(
         initial_capital=capital,
         commission_pct=0.001,  # 0.1%
         slippage_pct=0.0005,  # 0.05%
-        max_drawdown_pct=max_dd,
-        max_daily_loss_pct=max_dd / 2,  # Half of max DD
+        max_drawdown_pct=guardian_threshold,  # GUARDIAN threshold, not actual limit
+        max_daily_loss_pct=guardian_threshold / 2,  # Half of guardian
     )
 
     backtester = VectorizedBacktester(config)
