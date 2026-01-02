@@ -17,7 +17,7 @@ import json
 import logging
 import MetaTrader5 as mt5
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional, Dict, List, Tuple, Any, Callable
 from enum import Enum
 from pathlib import Path
@@ -44,38 +44,60 @@ class ViolationType(Enum):
     MAX_POSITIONS_EXCEEDED = "max_positions_exceeded"
     HEDGING_DETECTED = "hedging_detected"
     INACTIVITY_VIOLATION = "inactivity_violation"
+    # GFT-specific violations
+    TRADE_FLOATING_LOSS_EXCEEDED = "trade_floating_loss_exceeded"  # 2% per-trade limit
+    TRADE_RISK_TOO_HIGH = "trade_risk_too_high"  # Pre-trade check for 2% limit
 
 
 @dataclass
 class FirmRules:
     """
     Immutable prop firm rules - DO NOT MODIFY AT RUNTIME.
+
+    GFT Instant Funding GOAT Model Rules (as of 2024):
+    - 6% trailing max drawdown (from equity high water mark)
+    - 3% daily drawdown (resets 5 PM EST)
+    - 2% max floating loss per trade (HARD BREACH - immediate closure)
+    - 15% consistency rule (no single day > 15% of total profits)
+    - 5 minimum trading days @ 0.5% profit each for payout
     """
     firm_type: FirmType
     initial_balance: float
-    
-    # Drawdown limits
+
+    # Overall Drawdown limits
     max_overall_drawdown_pct: float
     guardian_drawdown_pct: float  # Stop trading before actual limit
-    
-    # Daily limits (The5ers only)
+    drawdown_reference: str = "equity"  # "equity" or "balance"
+
+    # Daily limits
     max_daily_loss_pct: Optional[float] = None
     guardian_daily_loss_pct: Optional[float] = None
-    
-    # Consistency rule (The5ers only)
-    consistency_max_single_day_pct: Optional[float] = None
-    
+    daily_reset_time: str = "00:00"  # Time of day for reset
+    daily_reset_timezone: str = "UTC"  # Timezone for reset
+
+    # Per-Trade Floating Loss Limit (GFT CRITICAL - HARD BREACH)
+    max_trade_floating_loss_pct: Optional[float] = None  # 2% for GFT
+    guardian_trade_floating_loss_pct: Optional[float] = None  # 1.5% guardian
+
+    # Consistency rule
+    consistency_max_single_day_pct: Optional[float] = None  # 15% for GFT
+    consistency_is_hard_breach: bool = False  # GFT: False (just blocks payout)
+
+    # Payout requirements
+    min_trading_days_for_payout: int = 0  # 5 for GFT
+    min_profit_per_trading_day_pct: float = 0.0  # 0.5% for GFT
+
     # Position limits
     max_risk_per_trade_pct: float = 1.0
     max_open_positions: int = 5
-    
+
     # Allowed instruments
     allowed_instruments: List[str] = field(default_factory=list)
-    
+
     # Prohibited patterns
     allow_hedging: bool = False
     allow_martingale: bool = False
-    
+
     # Inactivity
     max_inactivity_days: int = 30
     inactivity_warning_days: int = 25
@@ -89,28 +111,38 @@ class AccountRiskState:
     # Balance tracking
     initial_balance: float
     highest_balance: float  # High water mark for trailing DD
-    current_balance: float
-    current_equity: float
-    
+    highest_equity: float = 0.0  # Equity HWM for GFT trailing DD
+    current_balance: float = 0.0
+    current_equity: float = 0.0
+
     # Daily tracking
-    daily_starting_balance: float
-    daily_pnl: float
-    daily_date: str
-    
+    daily_starting_balance: float = 0.0
+    daily_starting_equity: float = 0.0  # For GFT daily DD from equity
+    daily_pnl: float = 0.0
+    daily_date: str = ""
+
     # Profit tracking
     total_realized_profit: float = 0.0
     daily_profit_distribution: Dict[str, float] = field(default_factory=dict)
-    
+
+    # Trading days tracking (for GFT payout eligibility)
+    qualifying_trading_days: int = 0  # Days with >= 0.5% profit
+    trading_days_this_period: List[str] = field(default_factory=list)
+
     # Trade tracking
     last_trade_time: Optional[str] = None
     days_since_last_trade: int = 0
     total_trades: int = 0
-    
+
     # Lock state
     is_locked: bool = False
     lock_reason: Optional[str] = None
     lock_time: Optional[str] = None
-    
+
+    # Payout eligibility
+    payout_blocked: bool = False
+    payout_blocked_reason: Optional[str] = None
+
     # Statistics
     winning_trades: int = 0
     losing_trades: int = 0
@@ -163,42 +195,59 @@ class RiskManager:
     def update_account_state(self, balance: float, equity: float) -> Dict[str, Any]:
         """
         Update account balances and check for violations.
-        
+
         Args:
             balance: Current account balance
             equity: Current account equity
-            
+
         Returns:
             Dictionary with current risk metrics
         """
         self.state.current_balance = balance
         self.state.current_equity = equity
-        
-        # Update high water mark
+
+        # Update high water marks
         if balance > self.state.highest_balance:
             self.state.highest_balance = balance
-            logger.info(f"New high water mark: ${balance:.2f}")
-        
-        # Check for daily reset
-        today = date.today().isoformat()
-        if self.state.daily_date != today:
-            self._reset_daily_tracking(today)
-        
-        # Update daily P&L
-        self.state.daily_pnl = balance - self.state.daily_starting_balance
-        
+            logger.info(f"New balance HWM: ${balance:.2f}")
+
+        if equity > self.state.highest_equity:
+            self.state.highest_equity = equity
+            logger.info(f"New equity HWM: ${equity:.2f}")
+
+        # Check for daily reset (handle timezone for GFT)
+        if self._should_reset_daily():
+            self._reset_daily_tracking_tz()
+
+        # Update daily P&L (from equity for GFT)
+        if self.rules.drawdown_reference == "equity":
+            self.state.daily_pnl = equity - self.state.daily_starting_equity
+        else:
+            self.state.daily_pnl = balance - self.state.daily_starting_balance
+
         # Check for violations
         violations = self._check_all_violations()
-        
+
+        # Check floating PnL on all positions (CRITICAL for GFT)
+        positions_at_risk = self.monitor_floating_pnl()
+        for pos in positions_at_risk:
+            self.emergency_close_position(pos["ticket"], pos["reason"])
+            violations.append(f"EMERGENCY_CLOSE_{pos['ticket']}")
+
+        # Update payout eligibility
+        self._update_payout_eligibility()
+
         # Persist state
         self._save_state()
-        
+
         return {
             "current_drawdown_pct": self.get_current_drawdown_pct(),
             "daily_pnl": self.state.daily_pnl,
             "daily_pnl_pct": self.get_daily_loss_pct(),
             "distance_to_guardian": self.rules.guardian_drawdown_pct - self.get_current_drawdown_pct(),
             "is_locked": self.state.is_locked,
+            "payout_eligible": not self.state.payout_blocked,
+            "qualifying_trading_days": self.state.qualifying_trading_days,
             "violations": violations,
         }
     
@@ -350,7 +399,14 @@ class RiskManager:
             if not self.check_consistency_rule(0):  # Check if we can trade at all
                 return False, ViolationType.CONSISTENCY_RULE_VIOLATION, \
                     "Would violate consistency rule"
-        
+
+        # Check per-trade floating loss limit (GFT 2% rule)
+        is_safe, error_msg = self.check_pre_trade_risk(
+            symbol, lot_size, entry_price, stop_loss, direction
+        )
+        if not is_safe:
+            return False, ViolationType.TRADE_RISK_TOO_HIGH, error_msg
+
         return True, None, "Trade validated"
     
     def record_trade_result(self, pnl: float, is_winner: bool):
@@ -420,12 +476,22 @@ class RiskManager:
         return projected_daily <= max_allowed
     
     def get_current_drawdown_pct(self) -> float:
-        """Calculate current drawdown from high water mark."""
-        if self.state.highest_balance == 0:
+        """
+        Calculate current drawdown from high water mark.
+
+        NOTE: For GFT, this uses EQUITY high water mark, not balance.
+        """
+        if self.rules.drawdown_reference == "equity":
+            hwm = self.state.highest_equity
+            current = self.state.current_equity
+        else:
+            hwm = self.state.highest_balance
+            current = self.state.current_balance
+
+        if hwm == 0:
             return 0.0
-        
-        return ((self.state.highest_balance - self.state.current_equity) / 
-                self.state.highest_balance) * 100
+
+        return ((hwm - current) / hwm) * 100
     
     def get_daily_loss_pct(self) -> float:
         """Calculate current daily loss percentage."""
@@ -462,20 +528,211 @@ class RiskManager:
     def emergency_close_all(self, reason: str):
         """
         Emergency liquidation trigger.
-        
+
         Args:
             reason: Reason for emergency close
         """
         logger.critical(f"EMERGENCY CLOSE ALL: {reason}")
-        
+
         self.state.is_locked = True
         self.state.lock_reason = reason
         self.state.lock_time = datetime.now().isoformat()
-        
+
         self._save_state()
-        
+
         if self.on_violation:
             self.on_violation(ViolationType.MAX_DRAWDOWN_EXCEEDED, reason)
+
+    def monitor_floating_pnl(self) -> List[Dict]:
+        """
+        CRITICAL: Monitor all open positions for 2% floating loss breach.
+
+        This MUST be called frequently (every tick or at minimum every second)
+        for GFT accounts. A breach of 2% floating loss on ANY single trade
+        causes IMMEDIATE account closure.
+
+        Returns:
+            List of positions that need emergency closure
+        """
+        if not self.rules.max_trade_floating_loss_pct:
+            return []
+
+        positions_to_close = []
+
+        try:
+            positions = mt5.positions_get()
+            if not positions:
+                return []
+
+            for pos in positions:
+                # Calculate floating PnL as percentage of account equity
+                if self.state.current_equity <= 0:
+                    continue
+
+                floating_pnl_pct = (pos.profit / self.state.current_equity) * 100
+
+                # Check against guardian limit (1.5% for GFT)
+                if floating_pnl_pct <= -self.rules.guardian_trade_floating_loss_pct:
+                    positions_to_close.append({
+                        "ticket": pos.ticket,
+                        "symbol": pos.symbol,
+                        "floating_pnl": pos.profit,
+                        "floating_pnl_pct": floating_pnl_pct,
+                        "reason": f"Floating loss {floating_pnl_pct:.2f}% exceeds guardian {self.rules.guardian_trade_floating_loss_pct}%"
+                    })
+
+                    logger.critical(
+                        f"CRITICAL: Position {pos.ticket} ({pos.symbol}) floating loss "
+                        f"{floating_pnl_pct:.2f}% approaching 2% hard breach limit!"
+                    )
+
+                # Extra warning at 1% (for GFT with 1.5% guardian)
+                elif floating_pnl_pct <= -1.0:
+                    logger.warning(
+                        f"WARNING: Position {pos.ticket} ({pos.symbol}) floating loss "
+                        f"{floating_pnl_pct:.2f}% - monitor closely"
+                    )
+
+        except Exception as e:
+            logger.error(f"Error monitoring floating PnL: {e}")
+
+        return positions_to_close
+
+    def emergency_close_position(self, ticket: int, reason: str) -> bool:
+        """
+        Emergency close a specific position to prevent hard breach.
+
+        Args:
+            ticket: MT5 position ticket
+            reason: Reason for emergency closure
+
+        Returns:
+            True if closed successfully
+        """
+        try:
+            position = mt5.positions_get(ticket=ticket)
+            if not position:
+                logger.warning(f"Position {ticket} not found for emergency close")
+                return False
+
+            pos = position[0]
+
+            # Determine close direction
+            if pos.type == mt5.POSITION_TYPE_BUY:
+                order_type = mt5.ORDER_TYPE_SELL
+                price = mt5.symbol_info_tick(pos.symbol).bid
+            else:
+                order_type = mt5.ORDER_TYPE_BUY
+                price = mt5.symbol_info_tick(pos.symbol).ask
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": pos.symbol,
+                "volume": pos.volume,
+                "type": order_type,
+                "position": ticket,
+                "price": price,
+                "deviation": 50,  # High deviation for emergency
+                "magic": pos.magic,
+                "comment": f"EMERGENCY: {reason[:20]}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            result = mt5.order_send(request)
+
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.critical(f"EMERGENCY CLOSE SUCCESS: {ticket} - {reason}")
+
+                if self.on_violation:
+                    self.on_violation(
+                        ViolationType.TRADE_FLOATING_LOSS_EXCEEDED,
+                        f"Emergency closed position {ticket}: {reason}"
+                    )
+
+                return True
+            else:
+                logger.critical(f"EMERGENCY CLOSE FAILED: {ticket} - {result.comment}")
+                return False
+
+        except Exception as e:
+            logger.critical(f"EMERGENCY CLOSE ERROR: {ticket} - {e}")
+            return False
+
+    def check_pre_trade_risk(
+        self,
+        symbol: str,
+        lot_size: float,
+        entry_price: float,
+        stop_loss: float,
+        direction: str
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Pre-trade check to ensure trade cannot breach 2% floating loss limit.
+
+        This calculates the MAXIMUM possible loss if price hits stop loss
+        and verifies it's under the guardian limit.
+
+        Args:
+            symbol: Trading symbol
+            lot_size: Position size in lots
+            entry_price: Intended entry price
+            stop_loss: Stop loss price
+            direction: "buy" or "sell"
+
+        Returns:
+            Tuple of (is_safe, error_message)
+        """
+        if not self.rules.max_trade_floating_loss_pct:
+            return True, None
+
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if not symbol_info:
+                return False, f"Cannot get symbol info for {symbol}"
+
+            # Calculate max loss in account currency
+            if direction == "buy":
+                price_diff = entry_price - stop_loss
+            else:
+                price_diff = stop_loss - entry_price
+
+            # Convert to account currency
+            tick_value = symbol_info.trade_tick_value
+            tick_size = symbol_info.trade_tick_size
+
+            if tick_size == 0:
+                return False, "Invalid tick size"
+
+            ticks_to_sl = abs(price_diff) / tick_size
+            max_loss = ticks_to_sl * tick_value * lot_size
+
+            # Calculate as percentage of equity
+            if self.state.current_equity <= 0:
+                return False, "Invalid equity"
+
+            max_loss_pct = (max_loss / self.state.current_equity) * 100
+
+            # Check against guardian limit
+            if max_loss_pct >= self.rules.guardian_trade_floating_loss_pct:
+                return False, (
+                    f"Trade max loss {max_loss_pct:.2f}% exceeds guardian "
+                    f"{self.rules.guardian_trade_floating_loss_pct}% "
+                    f"(hard limit: {self.rules.max_trade_floating_loss_pct}%)"
+                )
+
+            # Warning if close to limit
+            if max_loss_pct >= self.rules.guardian_trade_floating_loss_pct * 0.7:
+                logger.warning(
+                    f"Trade max loss {max_loss_pct:.2f}% is close to "
+                    f"guardian limit {self.rules.guardian_trade_floating_loss_pct}%"
+                )
+
+            return True, None
+
+        except Exception as e:
+            logger.error(f"Pre-trade risk check error: {e}")
+            return False, str(e)
     
     def unlock_account(self, confirmation: str = "CONFIRM"):
         """
@@ -718,17 +975,99 @@ class RiskManager:
         return violations
     
     def _reset_daily_tracking(self, new_date: str):
-        """Reset daily counters at start of new trading day."""
+        """Reset daily counters at start of new trading day (UTC-based legacy)."""
         logger.info(f"Daily reset: {self.state.daily_date} -> {new_date}")
-        
+
         # Record yesterday's P&L
         if self.state.daily_pnl != 0:
             self.state.daily_profit_distribution[self.state.daily_date] = self.state.daily_pnl
-        
+
         # Reset for new day
         self.state.daily_date = new_date
         self.state.daily_starting_balance = self.state.current_balance
+        self.state.daily_starting_equity = self.state.current_equity
         self.state.daily_pnl = 0.0
+
+    def _should_reset_daily(self) -> bool:
+        """Check if daily counters should reset based on timezone."""
+        try:
+            import pytz
+        except ImportError:
+            # Fallback to UTC if pytz not available
+            today = date.today().isoformat()
+            return self.state.daily_date != today
+
+        tz = pytz.timezone(self.rules.daily_reset_timezone)
+        now = datetime.now(tz)
+
+        reset_hour, reset_minute = map(int, self.rules.daily_reset_time.split(":"))
+
+        # Get the last reset time
+        today_reset = now.replace(hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
+
+        if now >= today_reset:
+            # Reset should have happened today
+            expected_date = now.strftime("%Y-%m-%d")
+        else:
+            # Reset happens later today, use yesterday's date
+            expected_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        return self.state.daily_date != expected_date
+
+    def _reset_daily_tracking_tz(self):
+        """Reset daily counters at configured reset time with timezone."""
+        try:
+            import pytz
+            tz = pytz.timezone(self.rules.daily_reset_timezone)
+            now = datetime.now(tz)
+        except ImportError:
+            now = datetime.now()
+
+        logger.info(f"Daily reset triggered at {now.isoformat()}")
+
+        # Record yesterday's P&L for consistency rule
+        if self.state.daily_pnl != 0:
+            self.state.daily_profit_distribution[self.state.daily_date] = self.state.daily_pnl
+
+            # Check if this was a qualifying trading day (>= 0.5% profit)
+            daily_profit_pct = (self.state.daily_pnl / self.state.initial_balance) * 100
+            if daily_profit_pct >= self.rules.min_profit_per_trading_day_pct:
+                self.state.qualifying_trading_days += 1
+                self.state.trading_days_this_period.append(self.state.daily_date)
+                logger.info(f"Qualifying trading day recorded: {daily_profit_pct:.2f}%")
+
+        # Reset for new day
+        self.state.daily_date = now.strftime("%Y-%m-%d")
+        self.state.daily_starting_balance = self.state.current_balance
+        self.state.daily_starting_equity = self.state.current_equity
+        self.state.daily_pnl = 0.0
+
+    def _update_payout_eligibility(self):
+        """Update payout eligibility based on consistency rule and trading days."""
+        self.state.payout_blocked = False
+        self.state.payout_blocked_reason = None
+
+        # Check minimum trading days
+        if self.state.qualifying_trading_days < self.rules.min_trading_days_for_payout:
+            self.state.payout_blocked = True
+            self.state.payout_blocked_reason = (
+                f"Need {self.rules.min_trading_days_for_payout} trading days, "
+                f"have {self.state.qualifying_trading_days}"
+            )
+            return
+
+        # Check consistency rule (no single day > 15% of total for GFT)
+        if self.rules.consistency_max_single_day_pct and self.state.total_realized_profit > 0:
+            if self.state.daily_profit_distribution:
+                max_daily = max(self.state.daily_profit_distribution.values())
+                max_daily_pct = (max_daily / self.state.total_realized_profit) * 100
+
+                if max_daily_pct >= self.rules.consistency_max_single_day_pct:
+                    self.state.payout_blocked = True
+                    self.state.payout_blocked_reason = (
+                        f"Best day is {max_daily_pct:.1f}% of total profit "
+                        f"(max allowed: {self.rules.consistency_max_single_day_pct}%)"
+                    )
     
     def _is_instrument_allowed(self, symbol: str) -> bool:
         """Check if instrument is in allowed list."""
@@ -803,21 +1142,57 @@ def create_gft_rules(
     initial_balance: float = 10000,
     symbols: List[str] = None
 ) -> FirmRules:
-    """Create rules for Goat Funded Trader accounts."""
+    """
+    Create rules for Goat Funded Trader Instant Funding GOAT Model.
+
+    CRITICAL LIMITS (as of 2024):
+    - 6% max total drawdown (trailing from equity HWM)
+    - 3% max daily drawdown (resets 5 PM EST)
+    - 2% max floating loss per trade (HARD BREACH!)
+    - 15% consistency rule (blocks payout, not hard breach)
+    - 5 trading days minimum @ 0.5% profit each for payout
+
+    WARNING: The 2% per-trade floating loss is an IMMEDIATE account closure.
+    We use 1.5% guardian to ensure we NEVER breach this.
+    """
     return FirmRules(
         firm_type=FirmType.GFT,
         initial_balance=initial_balance,
-        max_overall_drawdown_pct=8.0,
-        guardian_drawdown_pct=7.0,
-        max_daily_loss_pct=None,  # GFT doesn't have daily limit
-        guardian_daily_loss_pct=None,
-        consistency_max_single_day_pct=None,
-        max_risk_per_trade_pct=0.8,
-        max_open_positions=3,
+
+        # Total Drawdown - 6% trailing from EQUITY (not balance)
+        max_overall_drawdown_pct=6.0,
+        guardian_drawdown_pct=5.0,  # 1% safety buffer
+        drawdown_reference="equity",  # CRITICAL: GFT uses equity, not balance
+
+        # Daily Drawdown - 3% (resets 5 PM EST)
+        max_daily_loss_pct=3.0,
+        guardian_daily_loss_pct=2.5,  # 0.5% safety buffer
+        daily_reset_time="17:00",  # 5 PM
+        daily_reset_timezone="US/Eastern",  # EST/EDT
+
+        # Per-Trade Floating Loss - 2% HARD BREACH
+        # This is the most dangerous rule - immediate account closure
+        max_trade_floating_loss_pct=2.0,
+        guardian_trade_floating_loss_pct=1.5,  # 0.5% safety buffer - CRITICAL
+
+        # Consistency Rule - 15% (blocks payout only)
+        consistency_max_single_day_pct=15.0,
+        consistency_is_hard_breach=False,  # Does NOT close account
+
+        # Payout Requirements
+        min_trading_days_for_payout=5,
+        min_profit_per_trading_day_pct=0.5,
+
+        # Position limits - conservative to avoid 2% breach
+        max_risk_per_trade_pct=1.0,  # Well under 1.5% guardian
+        max_open_positions=3,  # Limit concurrent exposure
+
+        # Allowed instruments (crypto CFDs)
         allowed_instruments=symbols or [
             "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "LTCUSD",
             "BNBUSD", "ADAUSD", "DOTUSD", "AVAXUSD", "MATICUSD"
         ],
+
         allow_hedging=False,
         allow_martingale=False,
         max_inactivity_days=30,
