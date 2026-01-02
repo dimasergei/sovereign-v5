@@ -18,12 +18,19 @@ CRITICAL RULES (DO NOT MODIFY) - As of 2024:
 
 WARNING: The 2% per-trade floating loss limit is the most dangerous rule.
 It causes IMMEDIATE account closure if breached. We monitor this every second.
+
+Usage:
+    python gft_bot.py --config config/gft_account_1.py
+    python gft_bot.py --config config/gft_account_1.py --paper
+    python gft_bot.py --config config/gft_account_1.py --debug
 """
 
 import argparse
+import importlib.util
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, Any, Optional
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -38,40 +45,58 @@ from monitoring import TelegramConfig
 from bots.base_bot import BaseTradingBot
 
 
-# ============================================================================
-# CONFIGURATION - FILL THESE IN
-# ============================================================================
+# Default configuration (used if no config file provided)
+DEFAULT_CONFIG = {
+    'ACCOUNT_NAME': 'GFT_Account1',
+    'ACCOUNT_SIZE': 10000.0,
+    'FIRM': 'GFT',
+    'MT5_LOGIN': 12345678,
+    'MT5_PASSWORD': 'your_password',
+    'MT5_SERVER': 'GoatFundedTrader-Server',
+    'MT5_PATH': r'C:\Program Files\MetaTrader 5\terminal64.exe',
+    'TELEGRAM_TOKEN': '',
+    'TELEGRAM_CHAT_IDS': [],
+    'SYMBOLS': ['BTCUSD.x', 'ETHUSD.x', 'SOLUSD.x', 'XRPUSD.x', 'LTCUSD.x'],
+    'TIMEFRAME': 'M5',
+    'SCAN_INTERVAL': 60,
+    'MAX_DRAWDOWN_PERCENT': 5.0,
+    'DAILY_LOSS_PERCENT': 2.5,
+    'MAX_POSITIONS': 3,
+    'MAX_RISK_PER_TRADE': 1.5,
+    'DEFAULT_EXECUTION_STYLE': 'market',
+    'SLIPPAGE_TOLERANCE': 10,
+    'MAX_RETRIES': 3,
+}
 
-# Account identifier
-ACCOUNT_NAME = "GFT_Account1"
 
-# MT5 Credentials
-MT5_LOGIN = 12345678  # Your MT5 login
-MT5_PASSWORD = "your_password"  # Your MT5 password
-MT5_SERVER = "GoatFundedTrader-Server"  # Your broker server
-MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+def load_config(config_path: str) -> Dict[str, Any]:
+    """
+    Load configuration from a Python file.
 
-# Telegram (optional)
-TELEGRAM_ENABLED = True
-TELEGRAM_TOKEN = "your_bot_token"
-TELEGRAM_CHAT_IDS = [123456789]  # Your Telegram chat ID(s)
+    Args:
+        config_path: Path to the config file
 
-# Trading
-INITIAL_BALANCE = 10000.0
-SYMBOLS = [
-    "BTCUSD.x",
-    "ETHUSD.x",
-    "SOLUSD.x",
-    "XRPUSD.x",
-    "LTCUSD.x",
-]
+    Returns:
+        Dictionary with configuration values
+    """
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-# Timing
-SCAN_INTERVAL_SECONDS = 60
-TIMEFRAME = "M5"
+    # Load the config module dynamically
+    spec = importlib.util.spec_from_file_location("config", config_file)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
 
-# State file
-STATE_FILE = f"storage/state/{ACCOUNT_NAME}_state.json"
+    # Extract configuration values
+    config = {}
+    for key in DEFAULT_CONFIG.keys():
+        if hasattr(config_module, key):
+            config[key] = getattr(config_module, key)
+        else:
+            config[key] = DEFAULT_CONFIG[key]
+
+    return config
 
 
 # ============================================================================
@@ -90,25 +115,56 @@ class GFTBot(BaseTradingBot):
     - 2% max floating loss per trade (HARD BREACH!)
     """
 
-    def __init__(self):
+    def __init__(self, config: Dict[str, Any], paper_mode: bool = False):
+        """
+        Initialize GFT Bot with config.
+
+        Args:
+            config: Configuration dictionary
+            paper_mode: If True, simulate trades without executing
+        """
+        self.config = config
+        self.paper_mode = paper_mode
+
         # Create credentials
         credentials = MT5Credentials(
-            login=MT5_LOGIN,
-            password=MT5_PASSWORD,
-            server=MT5_SERVER,
-            path=MT5_PATH,
+            login=config['MT5_LOGIN'],
+            password=config['MT5_PASSWORD'],
+            server=config['MT5_SERVER'],
+            path=config['MT5_PATH'],
         )
 
         # Create firm rules with CORRECT GFT limits
         firm_rules = create_gft_rules(
-            initial_balance=INITIAL_BALANCE,
-            symbols=SYMBOLS
+            initial_balance=config['ACCOUNT_SIZE'],
+            symbols=config['SYMBOLS']
         )
+
+        # Override guardian limits from config if more conservative
+        if config.get('MAX_DRAWDOWN_PERCENT'):
+            firm_rules.guardian_drawdown_pct = min(
+                firm_rules.guardian_drawdown_pct,
+                config['MAX_DRAWDOWN_PERCENT']
+            )
+        if config.get('DAILY_LOSS_PERCENT'):
+            firm_rules.guardian_daily_loss_pct = min(
+                firm_rules.guardian_daily_loss_pct or 999,
+                config['DAILY_LOSS_PERCENT']
+            )
+        if config.get('MAX_RISK_PER_TRADE'):
+            firm_rules.guardian_trade_floating_loss_pct = min(
+                firm_rules.guardian_trade_floating_loss_pct or 999,
+                config['MAX_RISK_PER_TRADE']
+            )
+        if config.get('MAX_POSITIONS'):
+            firm_rules.max_positions = config['MAX_POSITIONS']
 
         # Log critical limits on startup
         logger = logging.getLogger(__name__)
         logger.critical("=" * 60)
         logger.critical("GFT INSTANT FUNDING GOAT MODEL RULES LOADED:")
+        logger.critical(f"  Account: {config['ACCOUNT_NAME']}")
+        logger.critical(f"  Paper Mode: {paper_mode}")
         logger.critical(f"  Max Total DD: {firm_rules.max_overall_drawdown_pct}% (Guardian: {firm_rules.guardian_drawdown_pct}%)")
         logger.critical(f"  Drawdown Reference: {firm_rules.drawdown_reference.upper()}")
         logger.critical(f"  Max Daily DD: {firm_rules.max_daily_loss_pct}% (Guardian: {firm_rules.guardian_daily_loss_pct}%)")
@@ -120,23 +176,105 @@ class GFTBot(BaseTradingBot):
 
         # Telegram config
         telegram_config = None
-        if TELEGRAM_ENABLED and TELEGRAM_TOKEN:
+        if config.get('TELEGRAM_TOKEN') and config['TELEGRAM_TOKEN'] != 'your_bot_token':
             telegram_config = TelegramConfig(
-                bot_token=TELEGRAM_TOKEN,
-                authorized_chat_ids=TELEGRAM_CHAT_IDS,
+                bot_token=config['TELEGRAM_TOKEN'],
+                authorized_chat_ids=config.get('TELEGRAM_CHAT_IDS', []),
             )
 
+        # State file
+        state_file = f"storage/state/{config['ACCOUNT_NAME']}_state.json"
+
         super().__init__(
-            account_name=ACCOUNT_NAME,
+            account_name=config['ACCOUNT_NAME'],
             credentials=credentials,
             firm_rules=firm_rules,
-            symbols=SYMBOLS,
-            state_file=STATE_FILE,
+            symbols=config['SYMBOLS'],
+            state_file=state_file,
             telegram_config=telegram_config,
-            scan_interval_seconds=SCAN_INTERVAL_SECONDS,
-            timeframe=TIMEFRAME,
+            scan_interval_seconds=config.get('SCAN_INTERVAL', 60),
+            timeframe=config.get('TIMEFRAME', 'M5'),
         )
-    
+
+        # Store execution settings
+        self.execution_style = config.get('DEFAULT_EXECUTION_STYLE', 'market')
+        self.slippage_tolerance = config.get('SLIPPAGE_TOLERANCE', 10)
+        self.max_retries = config.get('MAX_RETRIES', 3)
+
+    def _init_connection(self):
+        """Initialize MT5 connection (skip in paper mode)."""
+        if self.paper_mode:
+            logger = logging.getLogger(__name__)
+            logger.info("PAPER MODE: Skipping MT5 connection")
+            logger.info(f"PAPER MODE: Simulating account with ${self.config['ACCOUNT_SIZE']:.2f}")
+
+            # Initialize paper trading state
+            self._paper_balance = self.config['ACCOUNT_SIZE']
+            self._paper_equity = self.config['ACCOUNT_SIZE']
+            self._paper_positions = []
+            return
+
+        # Normal connection
+        super()._init_connection()
+
+    def _update_account_state(self) -> bool:
+        """Update account state (simulated in paper mode)."""
+        if self.paper_mode:
+            # Simulate account state
+            risk_status = self.risk_manager.update_account_state(
+                balance=self._paper_balance,
+                equity=self._paper_equity
+            )
+            if risk_status.get('violations'):
+                logging.getLogger(__name__).warning(f"Risk violations: {risk_status['violations']}")
+            return True
+
+        return super()._update_account_state()
+
+    def _analyze_and_trade(self, symbol: str):
+        """Analyze and trade (simulated execution in paper mode)."""
+        if self.paper_mode:
+            self._paper_analyze_and_trade(symbol)
+        else:
+            super()._analyze_and_trade(symbol)
+
+    def _paper_analyze_and_trade(self, symbol: str):
+        """Paper trading - log signals without executing."""
+        logger = logging.getLogger(__name__)
+
+        try:
+            # Get historical data
+            df = self.data_fetcher.get_historical_bars(
+                symbol, self.timeframe, 500
+            )
+
+            if df.empty or len(df) < 100:
+                return
+
+            # Generate signal
+            signal = self.signal_generator.generate_signal(symbol, df)
+
+            # Skip if neutral or low confidence
+            if signal.action == "neutral" or signal.confidence < 0.5:
+                return
+
+            # Log the signal (paper mode)
+            logger.info(
+                f"PAPER SIGNAL: {signal.action.upper()} {symbol} "
+                f"(confidence: {signal.confidence:.2f}, regime: {signal.regime})"
+            )
+
+            if self.telegram:
+                self.telegram.send_alert(
+                    f"[PAPER] Signal: {signal.action.upper()} {symbol}\n"
+                    f"Confidence: {signal.confidence:.2f}\n"
+                    f"Regime: {signal.regime}",
+                    level="info"
+                )
+
+        except Exception as e:
+            logger.error(f"Error analyzing {symbol}: {e}", exc_info=True)
+
     def _check_inactivity(self):
         """
         GFT-specific inactivity check.
@@ -152,13 +290,16 @@ class GFTBot(BaseTradingBot):
         if days_inactive >= 28:
             # Critical - place a minimal trade immediately
             logger.critical(f"Inactivity critical: {days_inactive} days - placing ping trade")
-            self._place_ping_trade()
+            if not self.paper_mode:
+                self._place_ping_trade()
+            else:
+                logger.info("PAPER MODE: Would place ping trade")
         elif days_inactive >= 25:
             # Warning - approaching limit
             logger.warning(f"Inactivity warning: {days_inactive} days since last trade")
             if self.telegram:
                 self.telegram.send_alert(
-                    f"⚠️ Inactivity Warning\n"
+                    f"Inactivity Warning\n"
                     f"Days since last trade: {days_inactive}\n"
                     f"Auto-ping at 28 days\n"
                     f"Max limit: 30 days",
@@ -167,33 +308,33 @@ class GFTBot(BaseTradingBot):
         elif days_inactive >= 20:
             # Info - reminder
             logger.info(f"Inactivity reminder: {days_inactive} days since last trade")
-    
+
     def _place_ping_trade(self):
         """Place minimal trade to avoid inactivity violation."""
         logger = logging.getLogger(__name__)
         logger.warning("Placing ping trade to avoid inactivity violation")
-        
+
         # Find most liquid symbol
         symbol = self.symbols[0] if self.symbols else "BTCUSD.x"
-        
+
         # Get symbol info
         symbol_info = self.connector.get_symbol_info(symbol)
         if not symbol_info:
             return
-        
+
         min_lot = symbol_info.get('volume_min', 0.01)
-        
+
         # Get current price
         import MetaTrader5 as mt5
         tick = mt5.symbol_info_tick(symbol)
         if not tick:
             return
-        
+
         # Place tiny long with tight SL/TP (will likely close quickly)
         entry = tick.ask
         sl = entry - (entry * 0.001)  # 0.1% SL
         tp = entry + (entry * 0.001)  # 0.1% TP
-        
+
         plan = self.executor.create_plan(
             symbol=symbol,
             direction="buy",
@@ -202,14 +343,14 @@ class GFTBot(BaseTradingBot):
             take_profit=tp,
             comment="ping_trade"
         )
-        
+
         result = self.executor.execute(plan)
-        
+
         if result.success:
             logger.info("Ping trade placed successfully")
             if self.telegram:
                 self.telegram.send_alert(
-                    f"📍 Ping trade placed to avoid inactivity\n"
+                    f"Ping trade placed to avoid inactivity\n"
                     f"Symbol: {symbol}\n"
                     f"Size: {min_lot}",
                     level="info"
@@ -235,7 +376,7 @@ def run_tests():
     assert rules.max_trade_floating_loss_pct == 2.0, f"Expected 2.0%, got {rules.max_trade_floating_loss_pct}%"
     assert rules.drawdown_reference == "equity", f"Expected 'equity', got {rules.drawdown_reference}"
     assert rules.daily_reset_timezone == "US/Eastern", f"Expected 'US/Eastern', got {rules.daily_reset_timezone}"
-    print("✓ GFT rules created correctly with CORRECTED limits")
+    print("GFT rules created correctly with CORRECTED limits")
 
     # Test 2: Drawdown calculation from EQUITY HWM
     state = AccountRiskState(
@@ -253,7 +394,7 @@ def run_tests():
     rm = RiskManager(rules, state, "/tmp/test_state.json")
     dd = rm.get_current_drawdown_pct()
     assert dd == 5.0, f"Expected 5.0%, got {dd}%"
-    print(f"✓ Drawdown calculation correct (from equity): {dd}%")
+    print(f"Drawdown calculation correct (from equity): {dd}%")
 
     # Test 3: Guardian limit - should reject at 5% DD (not 7%)
     state.current_equity = 9500  # 5% DD
@@ -264,19 +405,19 @@ def run_tests():
         "BTCUSD.x", 0.1, "buy", 50000, 49000, 52000
     )
     assert not valid, "Should reject trade at 5% guardian limit"
-    print(f"✓ Guardian limit enforced at 5% DD (corrected from 7%)")
+    print("Guardian limit enforced at 5% DD (corrected from 7%)")
 
     # Test 4: Symbol filtering
     assert rm._is_instrument_allowed("BTCUSD.x")
     assert rm._is_instrument_allowed("ETHUSD")
-    print("✓ Symbol filtering works")
+    print("Symbol filtering works")
 
     # Test 5: Verify critical per-trade limit exists
     assert rules.guardian_trade_floating_loss_pct == 1.5
-    print("✓ Per-trade floating loss guardian set to 1.5%")
+    print("Per-trade floating loss guardian set to 1.5%")
 
     print("\n" + "=" * 60)
-    print("All tests passed! ✓")
+    print("All tests passed!")
     print("CRITICAL: GFT limits are now CORRECT:")
     print(f"  - 6% max DD (was 8%)")
     print(f"  - 3% daily DD (was None)")
@@ -297,26 +438,36 @@ def run_backtest(days: int = 30):
 
 def main():
     parser = argparse.ArgumentParser(description="GFT Crypto Trading Bot")
+    parser.add_argument('--config', type=str, help='Path to config file (e.g., config/gft_account_1.py)')
+    parser.add_argument('--paper', action='store_true', help='Paper trading mode (simulate without executing)')
     parser.add_argument('--test', action='store_true', help='Run tests')
     parser.add_argument('--backtest', type=int, metavar='DAYS', help='Run backtest')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    
+
     args = parser.parse_args()
-    
+
     # Configure logging
     level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
+
     if args.test:
         run_tests()
     elif args.backtest:
         run_backtest(args.backtest)
     else:
+        # Load configuration
+        if args.config:
+            config = load_config(args.config)
+            logging.getLogger(__name__).info(f"Loaded config from {args.config}")
+        else:
+            config = DEFAULT_CONFIG.copy()
+            logging.getLogger(__name__).warning("No config file specified, using defaults")
+
         # Run the bot
-        bot = GFTBot()
+        bot = GFTBot(config, paper_mode=args.paper)
         bot.start()
 
 
