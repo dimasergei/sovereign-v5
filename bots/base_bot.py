@@ -18,17 +18,17 @@ import json
 import MetaTrader5 as mt5
 import schedule
 
-from ..core import (
+from core import (
     MT5Connector, MT5Credentials,
     RiskManager, FirmRules, AccountRiskState,
     FirmType
 )
-from ..core.lossless import MarketCalibrator
-from ..core.execution import SmartExecutor
-from ..data import MT5DataFetcher, FeatureEngineer
-from ..signals import SignalGenerator, TradingSignal
-from ..models import RegimeDetector, MeanReversionModel, EnsembleMetaLearner
-from ..monitoring import TelegramNotifier, TelegramConfig, AlertLevel
+from core.lossless import MarketCalibrator
+from core.execution import SmartExecutor
+from data import MT5DataFetcher, FeatureEngineer
+from signals import SignalGenerator, TradingSignal
+from models import RegimeDetector, MeanReversionModel, EnsembleMetaLearner
+from monitoring import TelegramNotifier, TelegramConfig, AlertLevel
 
 
 logger = logging.getLogger(__name__)
