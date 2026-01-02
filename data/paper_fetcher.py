@@ -37,13 +37,38 @@ CRYPTO_SYMBOLS = {
 
 FOREX_SYMBOLS = {
     'EURUSD': ('EUR', 'USD'),
+    'EURUSD.x': ('EUR', 'USD'),
     'GBPUSD': ('GBP', 'USD'),
+    'GBPUSD.x': ('GBP', 'USD'),
     'USDJPY': ('USD', 'JPY'),
+    'USDJPY.x': ('USD', 'JPY'),
     'AUDUSD': ('AUD', 'USD'),
+    'AUDUSD.x': ('AUD', 'USD'),
     'USDCAD': ('USD', 'CAD'),
+    'USDCAD.x': ('USD', 'CAD'),
     'EURGBP': ('EUR', 'GBP'),
+    'EURGBP.x': ('EUR', 'GBP'),
     'EURJPY': ('EUR', 'JPY'),
-    'XAUUSD': ('XAU', 'USD'),  # Gold
+    'EURJPY.x': ('EUR', 'JPY'),
+}
+
+# Gold symbol mapping
+GOLD_SYMBOLS = {
+    'XAUUSD': 'gold',
+    'XAUUSD.x': 'gold',
+    'XAU-USD': 'gold',
+}
+
+# Index symbols mapping to Yahoo Finance tickers
+INDEX_SYMBOLS = {
+    'NAS100': '^IXIC',      # NASDAQ Composite
+    'NAS100.x': '^IXIC',
+    'US30': '^DJI',         # Dow Jones Industrial Average
+    'US30.x': '^DJI',
+    'SPX500': '^GSPC',      # S&P 500
+    'SPX500.x': '^GSPC',
+    'US500': '^GSPC',
+    'US500.x': '^GSPC',
 }
 
 # Timeframe to minutes mapping
@@ -74,36 +99,86 @@ class PaperDataFetcher:
 
         # Base prices for synthetic data (updated periodically)
         self._base_prices = {
+            # Crypto
             'BTCUSD.x': 95000.0,
+            'BTCUSD': 95000.0,
             'ETHUSD.x': 3400.0,
+            'ETHUSD': 3400.0,
             'SOLUSD.x': 190.0,
+            'SOLUSD': 190.0,
             'XRPUSD.x': 2.20,
+            'XRPUSD': 2.20,
             'LTCUSD.x': 105.0,
+            'LTCUSD': 105.0,
+            # Forex
             'EURUSD': 1.0450,
+            'EURUSD.x': 1.0450,
             'GBPUSD': 1.2550,
+            'GBPUSD.x': 1.2550,
             'USDJPY': 157.50,
+            'USDJPY.x': 157.50,
             'AUDUSD': 0.6250,
+            'AUDUSD.x': 0.6250,
             'USDCAD': 1.4350,
+            'USDCAD.x': 1.4350,
             'EURGBP': 0.8330,
+            'EURGBP.x': 0.8330,
             'EURJPY': 164.50,
+            'EURJPY.x': 164.50,
+            # Gold
             'XAUUSD': 2650.0,
+            'XAUUSD.x': 2650.0,
+            # Indices
+            'NAS100': 21500.0,
+            'NAS100.x': 21500.0,
+            'US30': 43000.0,
+            'US30.x': 43000.0,
+            'SPX500': 6000.0,
+            'SPX500.x': 6000.0,
+            'US500': 6000.0,
+            'US500.x': 6000.0,
         }
 
         # Volatility estimates (daily %)
         self._volatility = {
+            # Crypto (high volatility)
             'BTCUSD.x': 0.03,
+            'BTCUSD': 0.03,
             'ETHUSD.x': 0.04,
+            'ETHUSD': 0.04,
             'SOLUSD.x': 0.05,
+            'SOLUSD': 0.05,
             'XRPUSD.x': 0.05,
+            'XRPUSD': 0.05,
             'LTCUSD.x': 0.04,
+            'LTCUSD': 0.04,
+            # Forex (low volatility)
             'EURUSD': 0.005,
+            'EURUSD.x': 0.005,
             'GBPUSD': 0.006,
+            'GBPUSD.x': 0.006,
             'USDJPY': 0.006,
+            'USDJPY.x': 0.006,
             'AUDUSD': 0.007,
+            'AUDUSD.x': 0.007,
             'USDCAD': 0.005,
+            'USDCAD.x': 0.005,
             'EURGBP': 0.004,
+            'EURGBP.x': 0.004,
             'EURJPY': 0.007,
+            'EURJPY.x': 0.007,
+            # Gold (medium volatility)
             'XAUUSD': 0.012,
+            'XAUUSD.x': 0.012,
+            # Indices (medium volatility)
+            'NAS100': 0.015,
+            'NAS100.x': 0.015,
+            'US30': 0.010,
+            'US30.x': 0.010,
+            'SPX500': 0.010,
+            'SPX500.x': 0.010,
+            'US500': 0.010,
+            'US500.x': 0.010,
         }
 
     def get_historical_bars(
@@ -153,15 +228,25 @@ class PaperDataFetcher:
         """Try to fetch real data from free APIs."""
         # Normalize symbol
         symbol_upper = symbol.upper()
+        symbol_clean = symbol.replace('.x', '').upper()
 
-        # Try crypto API
+        # Try crypto API (CoinGecko)
         if symbol_upper in CRYPTO_SYMBOLS or symbol in CRYPTO_SYMBOLS:
             return self._fetch_crypto_data(symbol, timeframe, count)
 
+        # Try gold API (CoinGecko has gold data too)
+        if symbol_upper in GOLD_SYMBOLS or symbol in GOLD_SYMBOLS or symbol_clean in GOLD_SYMBOLS:
+            return self._fetch_gold_data(symbol, timeframe, count)
+
+        # Try index data
+        if symbol_upper in INDEX_SYMBOLS or symbol in INDEX_SYMBOLS or symbol_clean in INDEX_SYMBOLS:
+            return self._fetch_index_data(symbol, timeframe, count)
+
         # For forex, use synthetic with current rate
-        if symbol_upper in FOREX_SYMBOLS:
+        if symbol_upper in FOREX_SYMBOLS or symbol in FOREX_SYMBOLS or symbol_clean in FOREX_SYMBOLS:
             return self._fetch_forex_data(symbol, timeframe, count)
 
+        # Unknown symbol - will fall back to synthetic
         return pd.DataFrame()
 
     def _fetch_crypto_data(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
@@ -256,6 +341,57 @@ class PaperDataFetcher:
             logger.warning(f"Failed to fetch forex data: {e}")
             return pd.DataFrame()
 
+    def _fetch_gold_data(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+        """Fetch gold data from free API."""
+        try:
+            # Try to get gold price from metals API or use synthetic
+            # Gold is available on some free APIs
+            try:
+                url = "https://api.coingecko.com/api/v3/simple/price?ids=tether-gold&vs_currencies=usd"
+                response = requests.get(url, timeout=5)
+                if response.status_code == 200:
+                    # Tether Gold tracks gold price
+                    data = response.json()
+                    if 'tether-gold' in data:
+                        current_price = data['tether-gold'].get('usd', 2650.0)
+                        self._base_prices[symbol] = current_price
+                        self._base_prices[symbol.upper()] = current_price
+            except:
+                pass
+
+            # Generate synthetic data based on current gold price
+            return self._generate_synthetic_data(symbol, timeframe, count)
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch gold data: {e}")
+            return pd.DataFrame()
+
+    def _fetch_index_data(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
+        """Fetch index data - generates synthetic data based on typical index values."""
+        try:
+            # Index data requires paid APIs (Yahoo Finance needs yfinance library)
+            # Use synthetic data with realistic index prices
+            symbol_clean = symbol.replace('.x', '').upper()
+
+            # Update base prices with recent approximate values
+            index_prices = {
+                'NAS100': 21500.0,  # NASDAQ ~21500
+                'US30': 43000.0,    # Dow Jones ~43000
+                'SPX500': 6000.0,   # S&P 500 ~6000
+                'US500': 6000.0,
+            }
+
+            if symbol_clean in index_prices:
+                self._base_prices[symbol] = index_prices[symbol_clean]
+                self._base_prices[symbol.upper()] = index_prices[symbol_clean]
+
+            logger.debug(f"Using synthetic data for index {symbol}")
+            return self._generate_synthetic_data(symbol, timeframe, count)
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch index data: {e}")
+            return pd.DataFrame()
+
     def _generate_synthetic_data(self, symbol: str, timeframe: str, count: int) -> pd.DataFrame:
         """Generate realistic synthetic OHLCV data."""
         # Get base price and volatility
@@ -345,6 +481,7 @@ class PaperDataFetcher:
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get mock symbol info for paper trading."""
         symbol_upper = symbol.upper()
+        symbol_clean = symbol.replace('.x', '').upper()
 
         # Crypto symbols
         if symbol_upper in CRYPTO_SYMBOLS or symbol in CRYPTO_SYMBOLS:
@@ -358,8 +495,32 @@ class PaperDataFetcher:
                 'trade_mode': 'full',
             }
 
+        # Gold symbols
+        if symbol_upper in GOLD_SYMBOLS or symbol in GOLD_SYMBOLS or symbol_clean in GOLD_SYMBOLS:
+            return {
+                'symbol': symbol,
+                'volume_min': 0.01,
+                'volume_max': 100.0,
+                'volume_step': 0.01,
+                'price_digits': 2,
+                'contract_size': 100.0,  # 100 oz per lot
+                'trade_mode': 'full',
+            }
+
+        # Index symbols
+        if symbol_upper in INDEX_SYMBOLS or symbol in INDEX_SYMBOLS or symbol_clean in INDEX_SYMBOLS:
+            return {
+                'symbol': symbol,
+                'volume_min': 0.01,
+                'volume_max': 100.0,
+                'volume_step': 0.01,
+                'price_digits': 2,
+                'contract_size': 1.0,
+                'trade_mode': 'full',
+            }
+
         # Forex symbols
-        if symbol_upper in FOREX_SYMBOLS:
+        if symbol_upper in FOREX_SYMBOLS or symbol in FOREX_SYMBOLS or symbol_clean in FOREX_SYMBOLS:
             digits = 3 if 'JPY' in symbol_upper else 5
             return {
                 'symbol': symbol,
