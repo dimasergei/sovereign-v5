@@ -3,6 +3,7 @@ Data Module - Data fetching, processing, and feature engineering.
 """
 
 from .mt5_fetcher import MT5DataFetcher, TIMEFRAMES
+from .paper_fetcher import PaperDataFetcher
 from .feature_engineer import FeatureEngineer
 
 # External data sources are optional (require aiohttp, etc.)
@@ -21,6 +22,7 @@ from .external import (
 
 __all__ = [
     'MT5DataFetcher',
+    'PaperDataFetcher',
     'TIMEFRAMES',
     'FeatureEngineer',
     'CoinglassClient',
