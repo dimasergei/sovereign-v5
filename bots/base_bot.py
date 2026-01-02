@@ -262,42 +262,62 @@ class BaseTradingBot(ABC):
     def _run_main_loop(self):
         """Main trading loop."""
         self.is_running = True
-        
+
         logger.info("Entering main loop...")
-        
+
+        last_floating_check = time.time()
+        FLOATING_CHECK_INTERVAL = 1.0  # Check every second for GFT
+
         while self.is_running:
             try:
                 # Run scheduled tasks
                 schedule.run_pending()
-                
+
+                # CRITICAL: Check floating PnL frequently for GFT accounts
+                if time.time() - last_floating_check >= FLOATING_CHECK_INTERVAL:
+                    if self.risk_manager and self.risk_manager.rules.max_trade_floating_loss_pct:
+                        positions_at_risk = self.risk_manager.monitor_floating_pnl()
+                        for pos in positions_at_risk:
+                            self.risk_manager.emergency_close_position(
+                                pos["ticket"],
+                                pos["reason"]
+                            )
+                            if self.telegram:
+                                self.telegram.send_alert(
+                                    f"🚨 EMERGENCY CLOSE: {pos['symbol']} "
+                                    f"({pos['floating_pnl_pct']:.2f}% loss)",
+                                    AlertLevel.CRITICAL
+                                )
+                    last_floating_check = time.time()
+
                 # Skip if paused
                 if self.is_paused:
                     time.sleep(1)
                     continue
-                
+
                 # Update account state
                 if not self._update_account_state():
                     time.sleep(30)
                     continue
-                
+
                 # Check if locked
                 if self.risk_manager.state.is_locked:
                     logger.warning("Account locked, skipping trading")
                     time.sleep(60)
                     continue
-                
+
                 # Scan symbols for signals
                 for symbol in self.symbols:
                     if not self.is_running:
                         break
                     self._analyze_and_trade(symbol)
-                
+
                 # Manage existing positions
                 self._manage_positions()
-                
+
                 # Sleep between iterations
                 time.sleep(self.scan_interval)
-                
+
             except Exception as e:
                 logger.error(f"Main loop error: {e}", exc_info=True)
                 if self.telegram:

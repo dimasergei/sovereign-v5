@@ -1,15 +1,23 @@
 """
 GFT Bot - Goat Funded Trader Crypto Bot.
 
-Standalone bot file for GFT $10,000 accounts trading crypto CFDs.
+Standalone bot file for GFT Instant Funding GOAT Model accounts trading crypto CFDs.
 
-RULES (DO NOT MODIFY):
-- Max overall drawdown: 8% (trailing from high water mark)
-- Guardian limit: 7% (stop trading before actual limit)
-- No daily loss limit
+CRITICAL RULES (DO NOT MODIFY) - As of 2024:
+- Max overall drawdown: 6% (trailing from EQUITY high water mark)
+- Guardian limit: 5% (stop trading before actual limit)
+- Max daily drawdown: 3% (resets 5 PM EST)
+- Guardian daily: 2.5%
+- Max floating loss per trade: 2% (HARD BREACH - IMMEDIATE ACCOUNT CLOSURE!)
+- Guardian per-trade: 1.5%
+- Consistency rule: 15% (no single day > 15% of total profits) - blocks payout only
+- Min trading days: 5 @ 0.5% profit each for payout
 - No hedging, martingale, or HFT
 - Max inactivity: 30 days
 - Crypto CFDs only
+
+WARNING: The 2% per-trade floating loss limit is the most dangerous rule.
+It causes IMMEDIATE account closure if breached. We monitor this every second.
 """
 
 import argparse
@@ -73,10 +81,15 @@ STATE_FILE = f"storage/state/{ACCOUNT_NAME}_state.json"
 class GFTBot(BaseTradingBot):
     """
     GFT-specific trading bot.
-    
-    Implements GFT-specific rules and overrides.
+
+    Implements GFT Instant Funding GOAT Model specific rules and overrides.
+
+    CRITICAL LIMITS:
+    - 6% max total DD (trailing from equity HWM)
+    - 3% max daily DD (resets 5 PM EST)
+    - 2% max floating loss per trade (HARD BREACH!)
     """
-    
+
     def __init__(self):
         # Create credentials
         credentials = MT5Credentials(
@@ -85,13 +98,26 @@ class GFTBot(BaseTradingBot):
             server=MT5_SERVER,
             path=MT5_PATH,
         )
-        
-        # Create firm rules
+
+        # Create firm rules with CORRECT GFT limits
         firm_rules = create_gft_rules(
             initial_balance=INITIAL_BALANCE,
             symbols=SYMBOLS
         )
-        
+
+        # Log critical limits on startup
+        logger = logging.getLogger(__name__)
+        logger.critical("=" * 60)
+        logger.critical("GFT INSTANT FUNDING GOAT MODEL RULES LOADED:")
+        logger.critical(f"  Max Total DD: {firm_rules.max_overall_drawdown_pct}% (Guardian: {firm_rules.guardian_drawdown_pct}%)")
+        logger.critical(f"  Drawdown Reference: {firm_rules.drawdown_reference.upper()}")
+        logger.critical(f"  Max Daily DD: {firm_rules.max_daily_loss_pct}% (Guardian: {firm_rules.guardian_daily_loss_pct}%)")
+        logger.critical(f"  Max Trade Loss: {firm_rules.max_trade_floating_loss_pct}% (Guardian: {firm_rules.guardian_trade_floating_loss_pct}%)")
+        logger.critical(f"  Daily Reset: {firm_rules.daily_reset_time} {firm_rules.daily_reset_timezone}")
+        logger.critical(f"  Consistency Rule: {firm_rules.consistency_max_single_day_pct}% of total profits")
+        logger.critical(f"  Min Trading Days: {firm_rules.min_trading_days_for_payout} @ {firm_rules.min_profit_per_trading_day_pct}%")
+        logger.critical("=" * 60)
+
         # Telegram config
         telegram_config = None
         if TELEGRAM_ENABLED and TELEGRAM_TOKEN:
@@ -99,7 +125,7 @@ class GFTBot(BaseTradingBot):
                 bot_token=TELEGRAM_TOKEN,
                 authorized_chat_ids=TELEGRAM_CHAT_IDS,
             )
-        
+
         super().__init__(
             account_name=ACCOUNT_NAME,
             credentials=credentials,
@@ -197,49 +223,65 @@ class GFTBot(BaseTradingBot):
 def run_tests():
     """Run basic tests on risk calculations."""
     print("Running GFT bot tests...")
-    
+
     from core import create_gft_rules, AccountRiskState, RiskManager
     from datetime import date
-    
-    # Test 1: GFT rules creation
+
+    # Test 1: GFT rules creation - CORRECTED LIMITS
     rules = create_gft_rules(10000)
-    assert rules.max_overall_drawdown_pct == 8.0
-    assert rules.guardian_drawdown_pct == 7.0
-    assert rules.max_daily_loss_pct is None
-    print("✓ GFT rules created correctly")
-    
-    # Test 2: Drawdown calculation
+    assert rules.max_overall_drawdown_pct == 6.0, f"Expected 6.0%, got {rules.max_overall_drawdown_pct}%"
+    assert rules.guardian_drawdown_pct == 5.0, f"Expected 5.0%, got {rules.guardian_drawdown_pct}%"
+    assert rules.max_daily_loss_pct == 3.0, f"Expected 3.0%, got {rules.max_daily_loss_pct}%"
+    assert rules.max_trade_floating_loss_pct == 2.0, f"Expected 2.0%, got {rules.max_trade_floating_loss_pct}%"
+    assert rules.drawdown_reference == "equity", f"Expected 'equity', got {rules.drawdown_reference}"
+    assert rules.daily_reset_timezone == "US/Eastern", f"Expected 'US/Eastern', got {rules.daily_reset_timezone}"
+    print("✓ GFT rules created correctly with CORRECTED limits")
+
+    # Test 2: Drawdown calculation from EQUITY HWM
     state = AccountRiskState(
         initial_balance=10000,
         highest_balance=10000,
+        highest_equity=10000,
         current_balance=9500,
         current_equity=9500,
         daily_starting_balance=10000,
+        daily_starting_equity=10000,
         daily_pnl=-500,
         daily_date=date.today().isoformat()
     )
-    
+
     rm = RiskManager(rules, state, "/tmp/test_state.json")
     dd = rm.get_current_drawdown_pct()
     assert dd == 5.0, f"Expected 5.0%, got {dd}%"
-    print(f"✓ Drawdown calculation correct: {dd}%")
-    
-    # Test 3: Guardian limit
-    state.current_equity = 9300  # 7% DD
-    rm.update_account_state(9300, 9300)
-    
+    print(f"✓ Drawdown calculation correct (from equity): {dd}%")
+
+    # Test 3: Guardian limit - should reject at 5% DD (not 7%)
+    state.current_equity = 9500  # 5% DD
+    state.highest_equity = 10000
+    rm.update_account_state(9500, 9500)
+
     valid, violation, msg = rm.validate_trade(
         "BTCUSD.x", 0.1, "buy", 50000, 49000, 52000
     )
-    assert not valid, "Should reject trade at guardian limit"
-    print(f"✓ Guardian limit enforced at 7% DD")
-    
+    assert not valid, "Should reject trade at 5% guardian limit"
+    print(f"✓ Guardian limit enforced at 5% DD (corrected from 7%)")
+
     # Test 4: Symbol filtering
     assert rm._is_instrument_allowed("BTCUSD.x")
     assert rm._is_instrument_allowed("ETHUSD")
     print("✓ Symbol filtering works")
-    
-    print("\nAll tests passed! ✓")
+
+    # Test 5: Verify critical per-trade limit exists
+    assert rules.guardian_trade_floating_loss_pct == 1.5
+    print("✓ Per-trade floating loss guardian set to 1.5%")
+
+    print("\n" + "=" * 60)
+    print("All tests passed! ✓")
+    print("CRITICAL: GFT limits are now CORRECT:")
+    print(f"  - 6% max DD (was 8%)")
+    print(f"  - 3% daily DD (was None)")
+    print(f"  - 2% per-trade (was None)")
+    print("=" * 60)
 
 
 def run_backtest(days: int = 30):
