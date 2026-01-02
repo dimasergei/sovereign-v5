@@ -303,9 +303,9 @@ def run_backtest(
     # Align data with signals
     df_aligned = df.loc[signals.index].copy()
 
-    # Use GUARDIAN threshold - stop 1% before actual limit
-    # This is critical for prop firm safety
-    guardian_threshold = max_dd - 1.0
+    # Use GUARDIAN threshold - stop 1.5% before actual limit
+    # This is critical for prop firm safety - gives buffer for slippage/volatility
+    guardian_threshold = max_dd - 1.5  # 4.5% for 6% limit
     logger.info(f"Using guardian threshold: {guardian_threshold}% (actual limit: {max_dd}%)")
 
     config = BacktestConfig(
