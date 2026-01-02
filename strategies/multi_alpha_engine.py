@@ -118,11 +118,13 @@ class MultiAlphaEngine:
 
     def _trend_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
         """
-        Trend following strategy.
+        Trend following strategy with MACRO TREND BIAS.
 
-        Edge: Momentum tends to persist in the short term.
-        Entry: Price above/below EMAs with momentum confirmation.
-        Less restrictive than before - we want more trades.
+        CRITICAL FIX: Check higher timeframe trend before allowing any signal.
+        In a bull market (price > EMA50 with rising slope), only generate LONG signals.
+        In a bear market (price < EMA50 with falling slope), only generate SHORT signals.
+
+        This prevents shorting in bull markets like BTCUSD 2024-2025.
         """
         close = df['close'].values
         high = df['high'].values
@@ -135,45 +137,84 @@ class MultiAlphaEngine:
         ema20 = self._ema(close, 20)
         ema50 = self._ema(close, 50)
 
-        # Momentum (rate of change) - LOWER threshold: 0.5% instead of 1.0%
+        # MACRO TREND DETECTION - THE KEY FIX
+        # Use 50-day slope and price position to determine macro trend
+        ema50_10_bars_ago = self._ema(close[:-10], 50) if len(close) > 60 else ema50
+        ema50_slope = (ema50 - ema50_10_bars_ago) / ema50_10_bars_ago * 100
+
+        macro_bullish = close[-1] > ema50 and ema50_slope > 0
+        macro_bearish = close[-1] < ema50 and ema50_slope < 0
+
+        # Momentum (rate of change)
         roc_10 = (close[-1] - close[-10]) / close[-10] * 100
         roc_5 = (close[-1] - close[-5]) / close[-5] * 100
 
         # ATR for stops
         atr = self._atr(high, low, close, 14)
 
-        # LONG: Price > EMA20 > EMA50, positive momentum
-        # Threshold lowered from 1.0% to 0.5%
-        if close[-1] > ema20 > ema50 and roc_10 > 0.5:
-            # Don't require perfect pullback - just not at extreme high
-            recent_high = max(close[-5:])
-            if close[-1] < recent_high * 1.02:  # Within 2% of high is OK (was 1%)
-                confidence = min(0.75, 0.45 + roc_10 / 10)
-                return AlphaSignal(
-                    strategy=StrategyType.TREND,
-                    direction=1.0,
-                    confidence=confidence,
-                    expected_move=atr / close[-1] * 100 * 2,
-                    holding_period=10,
-                    stop_distance=1.5,
-                    entry_reason="trend_momentum_long"
-                )
+        # LONG: Only in macro bullish environment
+        if macro_bullish:
+            # Standard trend following: price > EMA20 > EMA50 with momentum
+            if close[-1] > ema20 > ema50 and roc_10 > 0.3:
+                recent_high = max(close[-5:])
+                if close[-1] < recent_high * 1.02:
+                    confidence = min(0.75, 0.5 + roc_10 / 8)
+                    return AlphaSignal(
+                        strategy=StrategyType.TREND,
+                        direction=1.0,
+                        confidence=confidence,
+                        expected_move=atr / close[-1] * 100 * 2.5,
+                        holding_period=10,
+                        stop_distance=1.5,
+                        entry_reason="trend_momentum_long"
+                    )
 
-        # SHORT: Price < EMA20 < EMA50, negative momentum
-        if close[-1] < ema20 < ema50 and roc_10 < -0.5:
-            recent_low = min(close[-5:])
-            if close[-1] > recent_low * 0.98:  # Within 2% of low is OK
-                confidence = min(0.75, 0.45 + abs(roc_10) / 10)
-                return AlphaSignal(
-                    strategy=StrategyType.TREND,
-                    direction=-1.0,
-                    confidence=confidence,
-                    expected_move=atr / close[-1] * 100 * 2,
-                    holding_period=10,
-                    stop_distance=1.5,
-                    entry_reason="trend_momentum_short"
-                )
+            # Pullback entry in uptrend: Price pulled back to EMA20 but macro still bullish
+            if close[-1] < ema20 and close[-1] > ema50 and roc_5 > -2:
+                if close[-1] > close[-2]:  # Bouncing off support
+                    confidence = 0.65
+                    return AlphaSignal(
+                        strategy=StrategyType.TREND,
+                        direction=1.0,
+                        confidence=confidence,
+                        expected_move=atr / close[-1] * 100 * 2,
+                        holding_period=8,
+                        stop_distance=1.2,
+                        entry_reason="trend_pullback_long"
+                    )
 
+        # SHORT: Only in macro bearish environment
+        elif macro_bearish:
+            if close[-1] < ema20 < ema50 and roc_10 < -0.3:
+                recent_low = min(close[-5:])
+                if close[-1] > recent_low * 0.98:
+                    confidence = min(0.75, 0.5 + abs(roc_10) / 8)
+                    return AlphaSignal(
+                        strategy=StrategyType.TREND,
+                        direction=-1.0,
+                        confidence=confidence,
+                        expected_move=atr / close[-1] * 100 * 2.5,
+                        holding_period=10,
+                        stop_distance=1.5,
+                        entry_reason="trend_momentum_short"
+                    )
+
+            # Rally entry in downtrend: Price rallied to EMA20 but macro still bearish
+            if close[-1] > ema20 and close[-1] < ema50 and roc_5 < 2:
+                if close[-1] < close[-2]:  # Rejecting resistance
+                    confidence = 0.65
+                    return AlphaSignal(
+                        strategy=StrategyType.TREND,
+                        direction=-1.0,
+                        confidence=confidence,
+                        expected_move=atr / close[-1] * 100 * 2,
+                        holding_period=8,
+                        stop_distance=1.2,
+                        entry_reason="trend_rally_short"
+                    )
+
+        # NEUTRAL environment - no trend signal
+        # Don't trade trend strategy in choppy/transitioning markets
         return None
 
     def _mean_reversion_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
@@ -298,13 +339,14 @@ class MultiAlphaEngine:
 
     def _breakout_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
         """
-        Breakout strategy with TIGHTER PARAMETERS.
+        Breakout strategy with MACRO TREND BIAS.
 
-        FIX: Reduced lookback from 20 to 10 bars for more signals.
-        Also added momentum confirmation for higher quality.
+        CRITICAL FIX: Block counter-trend breakouts!
+        - Don't buy breakouts in macro bearish environment
+        - Don't short breakdowns in macro bullish environment
 
         Edge: Volatility expansion after compression often continues.
-        Entry: Break of recent range with momentum.
+        Entry: Break of recent range with momentum, IN TREND DIRECTION.
         """
         close = df['close'].values
         high = df['high'].values
@@ -312,6 +354,14 @@ class MultiAlphaEngine:
 
         if len(close) < 20:
             return None
+
+        # MACRO TREND DETECTION - same as trend strategy
+        ema50 = self._ema(close, 50)
+        ema50_10_bars_ago = self._ema(close[:-10], 50) if len(close) > 60 else ema50
+        ema50_slope = (ema50 - ema50_10_bars_ago) / ema50_10_bars_ago * 100
+
+        macro_bullish = close[-1] > ema50 and ema50_slope > 0
+        macro_bearish = close[-1] < ema50 and ema50_slope < 0
 
         # CHANGED: 10-bar range instead of 20 for more triggers
         lookback = 10
@@ -332,8 +382,12 @@ class MultiAlphaEngine:
         # Momentum confirmation
         momentum = (current - close[-5]) / close[-5] * 100 if len(close) >= 5 else 0
 
-        # LONG breakout
+        # LONG breakout - only if macro bullish OR neutral (not bearish)
         if current > range_high and prev <= range_high:
+            # DON'T buy breakouts in downtrend - they often fail
+            if macro_bearish:
+                return None
+
             confidence = 0.55
             if vol_compression:
                 confidence += 0.12  # Boost for compression breakout
@@ -341,6 +395,10 @@ class MultiAlphaEngine:
             # Additional boost if breaking with momentum
             if momentum > 1.0:
                 confidence += 0.08
+
+            # Extra confidence in uptrend
+            if macro_bullish:
+                confidence += 0.05
 
             return AlphaSignal(
                 strategy=StrategyType.BREAKOUT,
@@ -352,8 +410,12 @@ class MultiAlphaEngine:
                 entry_reason="range_breakout_long"
             )
 
-        # SHORT breakdown
+        # SHORT breakdown - only if macro bearish OR neutral (not bullish)
         if current < range_low and prev >= range_low:
+            # DON'T short breakdowns in uptrend - they often bounce
+            if macro_bullish:
+                return None
+
             confidence = 0.55
             if vol_compression:
                 confidence += 0.12
@@ -361,6 +423,10 @@ class MultiAlphaEngine:
             # Boost for momentum breakdown
             if momentum < -1.0:
                 confidence += 0.08
+
+            # Extra confidence in downtrend
+            if macro_bearish:
+                confidence += 0.05
 
             return AlphaSignal(
                 strategy=StrategyType.BREAKOUT,
