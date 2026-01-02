@@ -88,9 +88,11 @@ class TestRiskManager:
         state = AccountRiskState(
             initial_balance=5000,
             highest_balance=5000,
+            highest_equity=5000,
             current_balance=5000,
             current_equity=5000,
             daily_starting_balance=5000,
+            daily_starting_equity=5000,
             daily_pnl=0,
             daily_date=date.today().isoformat()
         )
@@ -158,18 +160,22 @@ class TestRiskManager:
     def test_daily_guardian_blocks_trading(self, the5ers_risk_manager):
         """Test The5ers daily guardian blocks trading."""
         rm = the5ers_risk_manager
-        
-        # At 4% daily loss (guardian)
-        rm.state.daily_pnl = -200
-        rm.state.current_balance = 4800
-        rm.state.current_equity = 4800
-        rm.update_account_state(4800, 4800)
-        
+
+        # At 4.5% daily loss (over 4% guardian threshold)
+        rm.state.daily_pnl = -225  # 4.5% of 5000
+        rm.state.current_balance = 4775
+        rm.state.current_equity = 4775
+        rm.update_account_state(4775, 4775)
+
+        # Check the daily loss is recorded
+        daily_loss_pct = rm.get_daily_loss_pct()
+        assert daily_loss_pct > 4.0, f"Daily loss should be > 4%, got {daily_loss_pct}%"
+
         valid, violation, msg = rm.validate_trade(
             "EURUSD", 0.1, "buy", 1.1000, 1.0950, 1.1100
         )
-        
-        assert not valid
+
+        assert not valid, f"Trade should be blocked at {daily_loss_pct}% daily loss (guardian: 4%)"
     
     def test_position_limit(self, gft_risk_manager):
         """Test max positions is enforced."""

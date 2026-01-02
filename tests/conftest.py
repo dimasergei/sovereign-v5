@@ -1,11 +1,15 @@
 """
 Pytest configuration and fixtures.
 
-Mocks MetaTrader5 module for testing on non-Windows platforms.
+Handles missing optional dependencies and provides test fixtures.
 """
 
 import sys
+import logging
 from unittest.mock import MagicMock
+
+# Configure logging for tests
+logging.basicConfig(level=logging.WARNING)
 
 # Mock MetaTrader5 module if not available (non-Windows platforms)
 if 'MetaTrader5' not in sys.modules:
@@ -72,8 +76,78 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 
+# Check for optional dependencies
+try:
+    import aiohttp
+    HAS_AIOHTTP = True
+except ImportError:
+    HAS_AIOHTTP = False
+
+try:
+    import tensorflow
+    HAS_TENSORFLOW = True
+except ImportError:
+    HAS_TENSORFLOW = False
+
+try:
+    import arch
+    HAS_ARCH = True
+except ImportError:
+    HAS_ARCH = False
+
+try:
+    import statsmodels
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
+
+
 # Fixtures
 import pytest
+
+
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line(
+        "markers", "requires_aiohttp: mark test as requiring aiohttp"
+    )
+    config.addinivalue_line(
+        "markers", "requires_tensorflow: mark test as requiring tensorflow"
+    )
+    config.addinivalue_line(
+        "markers", "requires_arch: mark test as requiring arch"
+    )
+    config.addinivalue_line(
+        "markers", "requires_statsmodels: mark test as requiring statsmodels"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip tests that require missing dependencies."""
+
+    if not HAS_AIOHTTP:
+        skip_aiohttp = pytest.mark.skip(reason="aiohttp not installed")
+        for item in items:
+            if "requires_aiohttp" in item.keywords:
+                item.add_marker(skip_aiohttp)
+
+    if not HAS_TENSORFLOW:
+        skip_tf = pytest.mark.skip(reason="tensorflow not installed")
+        for item in items:
+            if "requires_tensorflow" in item.keywords:
+                item.add_marker(skip_tf)
+
+    if not HAS_ARCH:
+        skip_arch = pytest.mark.skip(reason="arch not installed")
+        for item in items:
+            if "requires_arch" in item.keywords:
+                item.add_marker(skip_arch)
+
+    if not HAS_STATSMODELS:
+        skip_sm = pytest.mark.skip(reason="statsmodels not installed")
+        for item in items:
+            if "requires_statsmodels" in item.keywords:
+                item.add_marker(skip_sm)
 
 
 @pytest.fixture
@@ -104,3 +178,20 @@ def sample_ohlcv_data():
 def tmp_state_file(tmp_path):
     """Provide temporary file for risk state persistence."""
     return str(tmp_path / "risk_state.json")
+
+
+# Utility function for tests to check dependencies
+def requires_optional_dep(dep_name: str):
+    """Decorator to skip tests requiring optional dependencies."""
+    deps = {
+        'aiohttp': HAS_AIOHTTP,
+        'tensorflow': HAS_TENSORFLOW,
+        'arch': HAS_ARCH,
+        'statsmodels': HAS_STATSMODELS,
+    }
+
+    available = deps.get(dep_name, False)
+    return pytest.mark.skipif(
+        not available,
+        reason=f"{dep_name} not installed"
+    )
