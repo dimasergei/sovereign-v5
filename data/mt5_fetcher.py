@@ -8,7 +8,14 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-import MetaTrader5 as mt5
+# MT5 is optional - only available on Windows
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+
 import numpy as np
 import pandas as pd
 
@@ -18,18 +25,31 @@ from core import MT5Connector, InvalidSymbol
 logger = logging.getLogger(__name__)
 
 
-# Timeframe mapping
-TIMEFRAMES = {
-    'M1': mt5.TIMEFRAME_M1,
-    'M5': mt5.TIMEFRAME_M5,
-    'M15': mt5.TIMEFRAME_M15,
-    'M30': mt5.TIMEFRAME_M30,
-    'H1': mt5.TIMEFRAME_H1,
-    'H4': mt5.TIMEFRAME_H4,
-    'D1': mt5.TIMEFRAME_D1,
-    'W1': mt5.TIMEFRAME_W1,
-    'MN1': mt5.TIMEFRAME_MN1,
-}
+# Timeframe mapping (only populated if MT5 is available)
+if MT5_AVAILABLE:
+    TIMEFRAMES = {
+        'M1': mt5.TIMEFRAME_M1,
+        'M5': mt5.TIMEFRAME_M5,
+        'M15': mt5.TIMEFRAME_M15,
+        'M30': mt5.TIMEFRAME_M30,
+        'H1': mt5.TIMEFRAME_H1,
+        'H4': mt5.TIMEFRAME_H4,
+        'D1': mt5.TIMEFRAME_D1,
+        'W1': mt5.TIMEFRAME_W1,
+        'MN1': mt5.TIMEFRAME_MN1,
+    }
+else:
+    TIMEFRAMES = {
+        'M1': 1,
+        'M5': 5,
+        'M15': 15,
+        'M30': 30,
+        'H1': 60,
+        'H4': 240,
+        'D1': 1440,
+        'W1': 10080,
+        'MN1': 43200,
+    }
 
 
 class MT5DataFetcher:
@@ -71,10 +91,14 @@ class MT5DataFetcher:
         Returns:
             DataFrame with columns: time, open, high, low, close, volume
         """
+        if not MT5_AVAILABLE:
+            logger.error("MT5 not available")
+            return pd.DataFrame()
+
         if not self.connector.ensure_connected():
             logger.error("Not connected to MT5")
             return pd.DataFrame()
-        
+
         # Select symbol
         if not mt5.symbol_select(symbol, True):
             logger.error(f"Failed to select symbol {symbol}")
@@ -125,16 +149,16 @@ class MT5DataFetcher:
         Returns:
             DataFrame with OHLCV data
         """
-        if not self.connector.ensure_connected():
+        if not MT5_AVAILABLE or not self.connector.ensure_connected():
             return pd.DataFrame()
-        
+
         if not mt5.symbol_select(symbol, True):
             raise InvalidSymbol(f"Symbol {symbol} not available")
-        
+
         tf = TIMEFRAMES.get(timeframe.upper())
         if tf is None:
             raise ValueError(f"Invalid timeframe: {timeframe}")
-        
+
         rates = mt5.copy_rates_range(symbol, tf, start_date, end_date)
         
         if rates is None or len(rates) == 0:
@@ -151,7 +175,7 @@ class MT5DataFetcher:
         self,
         symbol: str,
         count: int,
-        flags: int = mt5.COPY_TICKS_ALL
+        flags: int = None
     ) -> pd.DataFrame:
         """
         Get recent tick data.
@@ -164,12 +188,16 @@ class MT5DataFetcher:
         Returns:
             DataFrame with tick data
         """
-        if not self.connector.ensure_connected():
+        if not MT5_AVAILABLE or not self.connector.ensure_connected():
             return pd.DataFrame()
-        
+
+        # Set default flags if not provided
+        if flags is None:
+            flags = mt5.COPY_TICKS_ALL
+
         if not mt5.symbol_select(symbol, True):
             raise InvalidSymbol(f"Symbol {symbol} not available")
-        
+
         ticks = mt5.copy_ticks_from(symbol, datetime.now(), count, flags)
         
         if ticks is None or len(ticks) == 0:
@@ -202,9 +230,9 @@ class MT5DataFetcher:
         Returns:
             List of symbol names
         """
-        if not self.connector.ensure_connected():
+        if not MT5_AVAILABLE or not self.connector.ensure_connected():
             return []
-        
+
         if filter_str:
             symbols = mt5.symbols_get(filter_str)
         else:
@@ -225,9 +253,9 @@ class MT5DataFetcher:
         Returns:
             Dictionary with bid, ask, last, spread
         """
-        if not self.connector.ensure_connected():
+        if not MT5_AVAILABLE or not self.connector.ensure_connected():
             return None
-        
+
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
