@@ -76,15 +76,16 @@ class MeanReversionModel(BaseModel):
         """
         prices = X.flatten() if len(X.shape) > 1 else X
         
-        # Use rolling stats if not fitted
+        # Calculate rolling stats
+        rolling_mean = np.mean(prices[-self.lookback:])
+        rolling_std = np.std(prices[-self.lookback:])
+
+        # Use rolling stats if not fitted, otherwise blend with fitted values
         if self.mean is None:
-            rolling_mean = np.mean(prices[-self.lookback:])
-            rolling_std = np.std(prices[-self.lookback:])
+            mean = rolling_mean
+            std = rolling_std
         else:
             # Blend fitted and rolling
-            rolling_mean = np.mean(prices[-self.lookback:])
-            rolling_std = np.std(prices[-self.lookback:])
-            
             mean = 0.7 * rolling_mean + 0.3 * self.mean
             std = 0.7 * rolling_std + 0.3 * self.std
         

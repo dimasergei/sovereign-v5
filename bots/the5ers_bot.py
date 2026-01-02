@@ -32,7 +32,7 @@ from core import (
     FirmType,
     create_the5ers_rules,
 )
-from monitoring import TelegramConfig
+from monitoring import TelegramConfig, AlertLevel
 from bots.base_bot import BaseTradingBot
 
 
@@ -288,7 +288,7 @@ class The5ersBot(BaseTradingBot):
                     f"[PAPER] Signal: {signal.action.upper()} {symbol}\n"
                     f"Confidence: {signal.confidence:.2f}\n"
                     f"Regime: {signal.regime}",
-                    level="info"
+                    level=AlertLevel.INFO
                 )
 
         except Exception as e:

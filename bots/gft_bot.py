@@ -41,7 +41,7 @@ from core import (
     FirmType,
     create_gft_rules,
 )
-from monitoring import TelegramConfig
+from monitoring import TelegramConfig, AlertLevel
 from bots.base_bot import BaseTradingBot
 
 
@@ -274,7 +274,7 @@ class GFTBot(BaseTradingBot):
                     f"[PAPER] Signal: {signal.action.upper()} {symbol}\n"
                     f"Confidence: {signal.confidence:.2f}\n"
                     f"Regime: {signal.regime}",
-                    level="info"
+                    level=AlertLevel.INFO
                 )
 
         except Exception as e:
@@ -308,7 +308,7 @@ class GFTBot(BaseTradingBot):
                     f"Days since last trade: {days_inactive}\n"
                     f"Auto-ping at 28 days\n"
                     f"Max limit: 30 days",
-                    level="warning"
+                    level=AlertLevel.WARNING
                 )
         elif days_inactive >= 20:
             # Info - reminder
@@ -358,7 +358,7 @@ class GFTBot(BaseTradingBot):
                     f"Ping trade placed to avoid inactivity\n"
                     f"Symbol: {symbol}\n"
                     f"Size: {min_lot}",
-                    level="info"
+                    level=AlertLevel.INFO
                 )
 
 
