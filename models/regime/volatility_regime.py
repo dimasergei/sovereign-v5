@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 try:
     from arch import arch_model
-    from arch.univariate import GARCH, EGARCH, FIGARCH
     ARCH_AVAILABLE = True
 except ImportError:
     ARCH_AVAILABLE = False
@@ -89,20 +88,36 @@ class GARCHModel(BaseModel):
         
         self.returns_std = np.std(returns)
         
-        # Create model based on variant
+        # Create model based on variant - use string identifiers for arch_model
         if self.variant == 'egarch':
-            vol = EGARCH(p=self.p, q=self.q)
+            self.model = arch_model(
+                returns,
+                vol='egarch',
+                p=self.p,
+                q=self.q,
+                dist=self.dist,
+                rescale=False
+            )
         elif self.variant == 'gjr':
-            vol = GARCH(p=self.p, o=1, q=self.q)
+            self.model = arch_model(
+                returns,
+                vol='garch',
+                p=self.p,
+                o=1,  # Asymmetric term for GJR-GARCH
+                q=self.q,
+                dist=self.dist,
+                rescale=False
+            )
         else:
-            vol = GARCH(p=self.p, q=self.q)
-        
-        self.model = arch_model(
-            returns,
-            vol=vol,
-            dist=self.dist,
-            rescale=False
-        )
+            # Standard GARCH
+            self.model = arch_model(
+                returns,
+                vol='garch',
+                p=self.p,
+                q=self.q,
+                dist=self.dist,
+                rescale=False
+            )
         
         # Fit with increased iterations
         self.fitted_model = self.model.fit(
@@ -133,16 +148,21 @@ class GARCHModel(BaseModel):
         if not self.is_trained:
             raise RuntimeError("Model not fitted")
         
-        # Get current volatility
-        cond_vol = self.fitted_model.conditional_volatility[-1]
+        # Get current volatility - handle both array and Series
+        cond_vol = self.fitted_model.conditional_volatility
+        if hasattr(cond_vol, 'iloc'):
+            current_vol = cond_vol.iloc[-1]
+            long_term_vol = cond_vol.mean()
+        else:
+            current_vol = cond_vol[-1]
+            long_term_vol = np.mean(cond_vol)
         
         # Forecast volatility
         forecast = self.fitted_model.forecast(horizon=1)
         forecast_vol = np.sqrt(forecast.variance.values[-1, 0])
         
         # Volatility regime
-        long_term_vol = self.fitted_model.conditional_volatility.mean()
-        vol_ratio = cond_vol / long_term_vol
+        vol_ratio = current_vol / long_term_vol
         
         # Signal based on vol regime
         if vol_ratio > 1.5:
@@ -171,7 +191,7 @@ class GARCHModel(BaseModel):
             magnitude=forecast_vol / 100,  # Expected daily move
             confidence=confidence,
             metadata={
-                'current_vol': float(cond_vol / 100),
+                'current_vol': float(current_vol / 100),
                 'forecast_vol': float(forecast_vol / 100),
                 'vol_ratio': float(vol_ratio),
                 'regime': regime,
@@ -212,16 +232,20 @@ class GARCHModel(BaseModel):
         
         cond_vol = self.fitted_model.conditional_volatility
         
-        # Current vs historical
-        current = cond_vol.iloc[-1]
-        mean_vol = cond_vol.mean()
-        std_vol = cond_vol.std()
+        # Handle both numpy array and pandas Series
+        if hasattr(cond_vol, 'iloc'):
+            current = cond_vol.iloc[-1]
+            mean_vol = cond_vol.mean()
+            std_vol = cond_vol.std()
+            vol_percentile = (cond_vol < current).mean() * 100
+        else:
+            current = cond_vol[-1]
+            mean_vol = np.mean(cond_vol)
+            std_vol = np.std(cond_vol)
+            vol_percentile = (np.sum(cond_vol < current) / len(cond_vol)) * 100
         
         # Z-score
         vol_zscore = (current - mean_vol) / std_vol
-        
-        # Percentile
-        vol_percentile = (cond_vol < current).mean() * 100
         
         # Regime classification
         if vol_zscore > 2:
@@ -250,9 +274,14 @@ class GARCHModel(BaseModel):
             return 0.0
         
         cond_vol = self.fitted_model.conditional_volatility
-        vol_returns = cond_vol.pct_change().dropna()
         
-        return float(vol_returns.std())
+        # Handle both numpy array and pandas Series
+        if hasattr(cond_vol, 'pct_change'):
+            vol_returns = cond_vol.pct_change().dropna()
+            return float(vol_returns.std())
+        else:
+            vol_returns = np.diff(cond_vol) / cond_vol[:-1]
+            return float(np.std(vol_returns))
     
     def _get_state(self) -> Dict[str, Any]:
         return {
