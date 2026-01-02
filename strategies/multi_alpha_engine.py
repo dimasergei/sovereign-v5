@@ -28,6 +28,10 @@ class StrategyType(Enum):
     LEAD_LAG = "lead_lag"
 
 
+# Crypto assets - NEVER SHORT these
+CRYPTO_PATTERNS = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LTC', 'BNB']
+
+
 @dataclass
 class AlphaSignal:
     """Individual alpha signal from one strategy."""
@@ -75,6 +79,13 @@ class MultiAlphaEngine:
         # Trade counting for debugging
         self.signal_counts = {s: 0 for s in StrategyType}
 
+    def _is_crypto(self, symbol: str) -> bool:
+        """Check if symbol is cryptocurrency - NEVER SHORT CRYPTO."""
+        if not symbol:
+            return False
+        upper = symbol.upper()
+        return any(pattern in upper for pattern in CRYPTO_PATTERNS)
+
     def generate_signals(
         self,
         df: pd.DataFrame,
@@ -91,8 +102,8 @@ class MultiAlphaEngine:
         """
         signals = []
 
-        # Run all strategies
-        trend_signal = self._trend_strategy(df)
+        # Run all strategies - pass symbol for crypto detection
+        trend_signal = self._trend_strategy(df, symbol=symbol)
         if trend_signal:
             signals.append(trend_signal)
             self.signal_counts[StrategyType.TREND] += 1
@@ -102,7 +113,7 @@ class MultiAlphaEngine:
             signals.append(mr_signal)
             self.signal_counts[StrategyType.MEAN_REVERSION] += 1
 
-        breakout_signal = self._breakout_strategy(df)
+        breakout_signal = self._breakout_strategy(df, symbol=symbol)
         if breakout_signal:
             signals.append(breakout_signal)
             self.signal_counts[StrategyType.BREAKOUT] += 1
@@ -116,7 +127,7 @@ class MultiAlphaEngine:
         # Combine signals
         return self._combine_signals(signals, df)
 
-    def _trend_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
+    def _trend_strategy(self, df: pd.DataFrame, symbol: str = None) -> Optional[AlphaSignal]:
         """
         Trend following strategy with MACRO TREND BIAS.
 
@@ -124,7 +135,7 @@ class MultiAlphaEngine:
         In a bull market (price > EMA50 with rising slope), only generate LONG signals.
         In a bear market (price < EMA50 with falling slope), only generate SHORT signals.
 
-        This prevents shorting in bull markets like BTCUSD 2024-2025.
+        CRYPTO: NEVER generate short signals for crypto assets.
         """
         close = df['close'].values
         high = df['high'].values
@@ -132,6 +143,9 @@ class MultiAlphaEngine:
 
         if len(close) < 50:
             return None
+
+        # Check if crypto - NEVER SHORT CRYPTO
+        is_crypto = self._is_crypto(symbol)
 
         # EMAs
         ema20 = self._ema(close, 20)
@@ -184,7 +198,8 @@ class MultiAlphaEngine:
                     )
 
         # SHORT: Only in macro bearish environment
-        elif macro_bearish:
+        # CRYPTO: NEVER SHORT - the edge is riding trends, not fading them
+        elif macro_bearish and not is_crypto:
             if close[-1] < ema20 < ema50 and roc_10 < -0.3:
                 recent_low = min(close[-5:])
                 if close[-1] > recent_low * 0.98:
@@ -297,7 +312,7 @@ class MultiAlphaEngine:
 
         return None
 
-    def _breakout_strategy(self, df: pd.DataFrame) -> Optional[AlphaSignal]:
+    def _breakout_strategy(self, df: pd.DataFrame, symbol: str = None) -> Optional[AlphaSignal]:
         """
         Breakout strategy with MACRO TREND BIAS.
 
@@ -305,8 +320,7 @@ class MultiAlphaEngine:
         - Don't buy breakouts in macro bearish environment
         - Don't short breakdowns in macro bullish environment
 
-        Edge: Volatility expansion after compression often continues.
-        Entry: Break of recent range with momentum, IN TREND DIRECTION.
+        CRYPTO: NEVER short breakdowns for crypto assets.
         """
         close = df['close'].values
         high = df['high'].values
@@ -314,6 +328,9 @@ class MultiAlphaEngine:
 
         if len(close) < 20:
             return None
+
+        # Check if crypto - NEVER SHORT CRYPTO
+        is_crypto = self._is_crypto(symbol)
 
         # MACRO TREND DETECTION - same as trend strategy
         ema50 = self._ema(close, 50)
@@ -372,6 +389,10 @@ class MultiAlphaEngine:
 
         # SHORT breakdown - only if macro bearish OR neutral (not bullish)
         if current < range_low and prev >= range_low:
+            # CRYPTO: NEVER SHORT BREAKDOWNS
+            if is_crypto:
+                return None
+
             # DON'T short breakdowns in uptrend - they often bounce
             if macro_bullish:
                 return None
