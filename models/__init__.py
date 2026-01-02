@@ -4,7 +4,7 @@ Models Module - Prediction models for the trading system.
 
 from .base import BaseModel, ModelPrediction
 from .ensemble import EnsembleMetaLearner, EnsemblePrediction
-from .statistical import MeanReversionModel, RegimeDetector, LeadLagDetector
+from .statistical_models import MeanReversionModel, RegimeDetector, LeadLagDetector
 from .temporal import (
     LSTMAttentionModel,
     TemporalTransformer,

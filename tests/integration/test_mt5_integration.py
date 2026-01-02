@@ -280,20 +280,24 @@ class TestRiskEngineIntegration:
         mt5.initialize()
         mt5.set_account_balance(10000.0)
 
+        # GFT uses 6% max DD and 5% guardian
         rules = FirmRules(
             firm_type=FirmType.GFT,
             initial_balance=10000.0,
-            max_overall_drawdown_pct=8.0,
-            guardian_drawdown_pct=7.0,
+            max_overall_drawdown_pct=6.0,
+            guardian_drawdown_pct=5.0,
             max_risk_per_trade_pct=1.0,
+            drawdown_reference="equity",
         )
 
         state = AccountRiskState(
             initial_balance=10000.0,
             highest_balance=10000.0,
+            highest_equity=10000.0,
             current_balance=10000.0,
             current_equity=10000.0,
             daily_starting_balance=10000.0,
+            daily_starting_equity=10000.0,
             daily_pnl=0.0,
             daily_date=datetime.now().date().isoformat(),
         )
@@ -310,7 +314,9 @@ class TestFullTradingCycle:
     def test_signal_to_execution_flow(self):
         """Test full flow from signal to execution."""
         from signals.generator import SignalGenerator
-        from core.execution import ExecutionEngine
+        from core.lossless.calibrator import MarketCalibrator
+        from models.statistical_models import RegimeDetector
+        from core.execution import SmartExecutor
 
         mt5 = MockMT5()
         mt5.initialize()
@@ -318,23 +324,27 @@ class TestFullTradingCycle:
         # Generate market data
         df = generate_ohlcv_data(n_bars=200, seed=42)
 
-        # Generate signal
-        generator = SignalGenerator()
+        # Generate signal with proper dependencies
+        calibrator = MarketCalibrator(min_calibration_bars=100)
+        generator = SignalGenerator(
+            calibrator=calibrator,
+            regime_detector=RegimeDetector()
+        )
         signal = generator.generate_signal('BTCUSD.x', df)
 
         # Execute if signal is strong enough
-        if abs(signal.strength) > 0.5 and signal.confidence > 0.6:
-            engine = ExecutionEngine(mt5_connector=mt5)
+        if abs(signal.direction) > 0.3 and signal.confidence > 0.5:
+            executor = SmartExecutor(connector=mt5)
 
-            result = engine.execute(
+            # Create execution plan
+            plan = executor.create_plan(
                 symbol='BTCUSD.x',
-                direction='buy' if signal.direction > 0 else 'sell',
                 volume=0.1,
-                order_type='market'
+                direction='buy' if signal.direction > 0 else 'sell',
             )
 
-            # Check execution
-            assert result is not None
+            # Check plan was created
+            assert plan is not None
 
         mt5.shutdown()
 

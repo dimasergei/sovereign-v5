@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from ..core.lossless import FullCalibrationResult
+from core.lossless import FullCalibrationResult
 
 
 logger = logging.getLogger(__name__)
