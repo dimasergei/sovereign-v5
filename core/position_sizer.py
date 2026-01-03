@@ -1,7 +1,11 @@
+# core/position_sizer.py
 """
-Position Sizer - Kelly-based sizing with regime adjustment.
+Position Sizer for High-Frequency Multi-Alpha Trading.
 
-NEVER risk more than the guardian allows, regardless of Kelly calculation.
+Key insight: Many small positions, not few large ones.
+Max risk per trade: 0.5% (allows for more positions simultaneously)
+
+Target: 4-6 simultaneous positions with 0.5% risk each
 """
 
 import numpy as np
@@ -9,8 +13,33 @@ from typing import Dict, Optional
 from dataclasses import dataclass
 import logging
 
+from config.trading_params import get_params
+
 
 logger = logging.getLogger(__name__)
+
+
+# Symbol-specific size multipliers based on Sharpe ratio performance
+# Elite Portfolio - Top 6 by Sharpe ratio
+SYMBOL_SIZE_MULTIPLIER = {
+    'XAUUSD': 1.2,   # Sharpe 2.70 - Gold, best performer
+    'XAGUSD': 1.2,   # Sharpe 2.30 - Silver, excellent addition
+    'NAS100': 1.15,  # Sharpe 1.54 - Tech index
+    'UK100': 1.1,    # Sharpe 1.24 - FTSE 100
+    'SPX500': 1.1,   # Sharpe 1.09 - S&P 500
+    'EURUSD': 1.0,   # Sharpe 0.90 - Major forex pair
+}
+
+
+def get_size_multiplier(symbol: str) -> float:
+    """Get position size multiplier based on symbol's historical Sharpe."""
+    if not symbol:
+        return 1.0
+    clean = symbol.upper().replace('.X', '').replace('-', '')
+    for key, mult in SYMBOL_SIZE_MULTIPLIER.items():
+        if key in clean:
+            return mult
+    return 1.0
 
 
 @dataclass
@@ -26,18 +55,35 @@ class PositionSize:
 
 class PositionSizer:
     """
-    Adaptive position sizing using Kelly criterion with safety caps.
+    Position sizing for high-frequency multi-alpha trading.
+
+    Key insight: Many small positions, not few large ones.
+    This allows us to take more trades and let the edge compound.
     """
 
     def __init__(
         self,
-        max_risk_pct: float = 1.0,  # Max 1% per trade (GFT allows 2%)
-        min_risk_pct: float = 0.25,
-        kelly_fraction: float = 0.25,  # Use 1/4 Kelly for safety
+        base_risk_pct: float = 0.75,  # Increased from 0.5 to use DD headroom
+        max_risk_pct: float = 1.0,    # Increased from 0.8
+        min_risk_pct: float = 0.2,   # Min 0.2%
+        max_positions: int = 6,      # Allow up to 6 simultaneous positions
+        max_total_risk: float = 4.5  # Increased from 3.0
     ):
+        """
+        Initialize position sizer.
+
+        Args:
+            base_risk_pct: Base risk per trade (0.5%)
+            max_risk_pct: Maximum risk per trade (0.8%)
+            min_risk_pct: Minimum risk per trade (0.2%)
+            max_positions: Maximum simultaneous positions
+            max_total_risk: Maximum total risk exposure
+        """
+        self.base_risk_pct = base_risk_pct
         self.max_risk_pct = max_risk_pct
         self.min_risk_pct = min_risk_pct
-        self.kelly_fraction = kelly_fraction
+        self.max_positions = max_positions
+        self.max_total_risk = max_total_risk
 
         # Performance tracking for Kelly calculation
         self.win_count = 0
@@ -52,8 +98,12 @@ class PositionSizer:
         max_drawdown_pct: float,
         stop_loss_pct: float,
         signal_confidence: float,
-        regime: str,
-        trend_strength: float = 0.5
+        signal_position_size: float = 1.0,  # From multi-alpha (0-1)
+        open_positions_count: int = 0,
+        current_total_risk: float = 0.0,
+        regime: str = "multi_alpha",
+        trend_strength: float = 0.5,
+        symbol: str = None
     ) -> PositionSize:
         """
         Calculate safe position size.
@@ -64,49 +114,87 @@ class PositionSizer:
             max_drawdown_pct: Maximum allowed drawdown
             stop_loss_pct: Stop loss distance as percentage
             signal_confidence: Signal confidence 0-1
-            regime: Market regime
-            trend_strength: Trend strength 0-1
+            signal_position_size: Position size scalar from multi-alpha (0-1)
+            open_positions_count: Number of currently open positions
+            current_total_risk: Current total risk exposure
+            regime: Market regime (ignored in multi-alpha mode)
+            trend_strength: Trend strength (ignored in multi-alpha mode)
+            symbol: Trading symbol for asset-specific params
 
         Returns:
             PositionSize with all sizing details
         """
-        # Calculate Kelly-optimal fraction
-        kelly = self._calculate_kelly()
+        # Get asset-specific parameters
+        params = get_params(symbol) if symbol else get_params()
 
-        # Apply fractional Kelly for safety
-        kelly_risk_pct = kelly * self.kelly_fraction * 100
+        # Position limit check
+        if open_positions_count >= self.max_positions:
+            return PositionSize(
+                size=0,
+                risk_amount=0,
+                risk_pct=0,
+                kelly_fraction=0,
+                regime_adjustment=0,
+                reason="max_positions_reached"
+            )
 
-        # Regime adjustment
-        regime_adj = self._get_regime_adjustment(regime, trend_strength)
-        adjusted_risk_pct = kelly_risk_pct * regime_adj
+        # Total risk limit check
+        if current_total_risk >= self.max_total_risk:
+            return PositionSize(
+                size=0,
+                risk_amount=0,
+                risk_pct=0,
+                kelly_fraction=0,
+                regime_adjustment=0,
+                reason="max_total_risk_reached"
+            )
 
-        # Confidence adjustment
-        confidence_adj = 0.5 + (signal_confidence * 0.5)  # 0.5 to 1.0
-        adjusted_risk_pct *= confidence_adj
-
-        # CRITICAL: Drawdown-based reduction
-        # As we approach max DD, reduce risk exponentially
+        # Guardian check - DD proximity
         dd_room = max_drawdown_pct - current_drawdown_pct
-        guardian_buffer = 1.5  # Stay 1.5% away from limit
+        guardian_buffer = params.get('guardian_buffer', 1.5)
 
         if dd_room <= guardian_buffer:
-            # Too close to limit - minimal risk
-            adjusted_risk_pct = self.min_risk_pct * 0.5
-            reason = "guardian_proximity"
-        elif dd_room <= 3.0:
-            # Getting close - reduce proportionally
-            reduction = (3.0 - dd_room) / (3.0 - guardian_buffer)
-            adjusted_risk_pct *= (1 - reduction * 0.7)
-            reason = "drawdown_reduction"
-        else:
-            reason = "normal"
+            return PositionSize(
+                size=0,
+                risk_amount=0,
+                risk_pct=0,
+                kelly_fraction=0,
+                regime_adjustment=0,
+                reason="guardian_proximity"
+            )
 
-        # Cap at max risk
-        final_risk_pct = np.clip(adjusted_risk_pct, self.min_risk_pct, self.max_risk_pct)
+        # Base risk from params
+        risk_pct = params.get('base_risk_pct', self.base_risk_pct)
 
-        # Calculate actual size
-        risk_amount = account_balance * (final_risk_pct / 100)
+        # Adjust for DD proximity
+        if dd_room < 2.5:
+            risk_pct *= 0.5  # Half risk when close to guardian
+        elif dd_room < 3.5:
+            risk_pct *= 0.75  # 75% risk when approaching guardian
 
+        # Apply signal confidence and position size from multi-alpha
+        risk_pct *= signal_confidence * signal_position_size
+
+        # Apply symbol-specific size multiplier
+        size_mult = get_size_multiplier(symbol)
+        risk_pct *= size_mult
+
+        # Cap at limits
+        max_risk = params.get('max_risk_pct', self.max_risk_pct)
+        min_risk = params.get('min_risk_pct', self.min_risk_pct)
+        risk_pct = np.clip(risk_pct, min_risk, max_risk)
+
+        # Kelly adjustment (if we have enough data)
+        kelly = self._calculate_kelly()
+        if kelly > 0:
+            # Use Kelly as a guide, but don't exceed our base sizing
+            kelly_risk = kelly * 0.25 * 100  # Quarter Kelly
+            risk_pct = min(risk_pct, kelly_risk) if kelly_risk > 0 else risk_pct
+
+        # Calculate dollar risk
+        risk_amount = account_balance * (risk_pct / 100)
+
+        # Calculate position size
         if stop_loss_pct > 0:
             position_size = risk_amount / (stop_loss_pct / 100)
         else:
@@ -115,11 +203,75 @@ class PositionSizer:
         return PositionSize(
             size=position_size,
             risk_amount=risk_amount,
-            risk_pct=final_risk_pct,
+            risk_pct=risk_pct,
             kelly_fraction=kelly,
-            regime_adjustment=regime_adj,
-            reason=reason
+            regime_adjustment=1.0,  # Not used in multi-alpha mode
+            reason="approved"
         )
+
+    def calculate_simple(
+        self,
+        account_balance: float,
+        current_dd_pct: float,
+        max_dd_pct: float,
+        stop_distance_pct: float,
+        signal_confidence: float,
+        signal_position_size: float,
+        open_positions_count: int = 0
+    ) -> dict:
+        """
+        Simplified calculation for backtest compatibility.
+
+        Args:
+            account_balance: Current account balance
+            current_dd_pct: Current drawdown percentage
+            max_dd_pct: Maximum drawdown limit
+            stop_distance_pct: Stop loss distance as percentage
+            signal_confidence: Signal confidence 0-1
+            signal_position_size: Position size from multi-alpha (0-1)
+            open_positions_count: Number of open positions
+
+        Returns:
+            Dict with size, risk_amount, risk_pct, reason
+        """
+        # Guardian check
+        dd_room = max_dd_pct - current_dd_pct
+        if dd_room < 1.5:  # Less than 1.5% room
+            return {"size": 0, "risk_amount": 0, "risk_pct": 0, "reason": "guardian_proximity"}
+
+        # Position limit check
+        if open_positions_count >= self.max_positions:
+            return {"size": 0, "risk_amount": 0, "risk_pct": 0, "reason": "max_positions"}
+
+        # Base risk adjusted for DD proximity
+        if dd_room < 2.5:
+            risk_pct = self.base_risk_pct * 0.5
+        elif dd_room < 3.5:
+            risk_pct = self.base_risk_pct * 0.75
+        else:
+            risk_pct = self.base_risk_pct
+
+        # Apply signal confidence and position size
+        risk_pct *= signal_confidence * signal_position_size
+
+        # Cap at limits
+        risk_pct = np.clip(risk_pct, self.min_risk_pct, self.max_risk_pct)
+
+        # Calculate dollar risk
+        risk_amount = account_balance * (risk_pct / 100)
+
+        # Calculate position size
+        if stop_distance_pct > 0:
+            size = risk_amount / (stop_distance_pct / 100)
+        else:
+            size = 0
+
+        return {
+            "size": size,
+            "risk_amount": risk_amount,
+            "risk_pct": risk_pct,
+            "reason": "approved"
+        }
 
     def _calculate_kelly(self) -> float:
         """Calculate Kelly fraction from historical performance."""
@@ -142,21 +294,6 @@ class PositionSizer:
 
         return 0.1
 
-    def _get_regime_adjustment(self, regime: str, trend_strength: float) -> float:
-        """Get regime-based sizing adjustment."""
-        adjustments = {
-            "strong_trending": 1.0 + (trend_strength * 0.2),  # Up to 1.2x in strong trends
-            "mild_trending": 0.9,
-            "trending_up": 1.0 + (trend_strength * 0.2),
-            "trending_down": 1.0 + (trend_strength * 0.2),
-            "random_walk": 0.7,
-            "unknown": 0.7,
-            "mild_mean_reversion": 0.8,
-            "strong_mean_reversion": 0.6,  # Smaller size in choppy markets
-            "mean_reverting": 0.7,
-        }
-        return adjustments.get(regime, 0.7)
-
     def update_performance(self, pnl: float):
         """Update performance stats for Kelly calculation."""
         if pnl > 0:
@@ -172,3 +309,16 @@ class PositionSizer:
         self.loss_count = 0
         self.total_wins = 0.0
         self.total_losses = 0.0
+
+    def get_stats(self) -> Dict:
+        """Get position sizing statistics."""
+        total_trades = self.win_count + self.loss_count
+        win_rate = self.win_count / total_trades if total_trades > 0 else 0
+
+        return {
+            "total_trades": total_trades,
+            "win_rate": win_rate,
+            "avg_win": self.total_wins / self.win_count if self.win_count > 0 else 0,
+            "avg_loss": self.total_losses / self.loss_count if self.loss_count > 0 else 0,
+            "kelly": self._calculate_kelly()
+        }

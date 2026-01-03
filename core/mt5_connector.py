@@ -9,7 +9,14 @@ Features:
 - Graceful degradation
 """
 
-import MetaTrader5 as mt5
+# MT5 is optional - only available on Windows
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    mt5 = None
+    MT5_AVAILABLE = False
+
 import time
 import threading
 import logging

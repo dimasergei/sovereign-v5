@@ -1,8 +1,17 @@
+# signals/generator.py
 """
-Signal Generator - Combines all signal sources into trading decisions.
+High-Frequency Multi-Alpha Signal Generator.
 
-CRITICAL: Now includes TrendFilter to prevent counter-trend trades.
-This is the #1 fix for preventing drawdowns.
+Key insight: Generate MORE signals, not fewer.
+Each signal is smaller, but many compound to high returns.
+
+Uses MultiAlphaEngine with 4 strategies:
+- Trend Following
+- Mean Reversion
+- Breakout
+- Lead-Lag
+
+Target: 150-200 trades/year per symbol with 52% win rate and 2:1 R:R
 """
 
 import logging
@@ -12,10 +21,8 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 import pandas as pd
 
-from core.lossless import MarketCalibrator, FullCalibrationResult
-from data import FeatureEngineer
-from models import EnsembleMetaLearner, RegimeDetector, EnsemblePrediction
-from signals.trend_filter import TrendFilter, TrendState, TrendDirection
+from strategies.multi_alpha_engine import MultiAlphaEngine, CombinedSignal
+from config.trading_params import get_params
 
 
 logger = logging.getLogger(__name__)
@@ -24,487 +31,187 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradingSignal:
     """Complete trading signal with all relevant information."""
-    symbol: str
-    action: str  # "long", "short", "neutral"
-    direction: float  # -1 to 1
-    confidence: float  # 0 to 1
-    position_scalar: float  # 0 to 1
+    symbol: str = ""
+    action: str = "neutral"  # "long", "short", "neutral"
+    direction: float = 0.0  # -1 to 1
+    confidence: float = 0.0  # 0 to 1
+    position_scalar: float = 1.0  # 0 to 1 (from multi-alpha)
 
-    # Risk parameters (derived from calibrator)
-    stop_loss_atr_mult: float
-    take_profit_atr_mult: float
+    # Risk parameters
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    stop_loss_atr_mult: float = 1.5
+    take_profit_atr_mult: float = 3.75
 
     # Context
-    regime: str
-    model_agreement: float
+    regime: str = "multi_alpha"
+    entry_reason: str = ""
+    model_agreement: float = 1.0
 
-    # Trend filter fields (CRITICAL FOR COUNTER-TREND PREVENTION)
-    trend_direction: str = "neutral"  # strong_up, mild_up, neutral, mild_down, strong_down
-    trend_strength: float = 0.0  # 0-1
-    higher_tf_aligned: bool = False
-    filter_reason: str = ""  # Why signal was filtered
-    filters_applied: List[str] = field(default_factory=list)
+    # Strategy info
+    strategies_agreeing: List[str] = field(default_factory=list)
+    primary_strategy: str = "none"
+    expected_holding: int = 0
 
     # Metadata
     timestamp: datetime = field(default_factory=datetime.now)
-    calibration_confidence: float = 0.0
     contributing_models: List[str] = field(default_factory=list)
 
-    # Raw values for order placement
+    # Market data
     current_price: float = 0.0
     atr: float = 0.0
-    
-    def get_stop_loss(self, entry_price: float, is_long: bool) -> float:
-        """Calculate stop loss price."""
-        distance = self.atr * self.stop_loss_atr_mult
-        if is_long:
-            return entry_price - distance
-        else:
-            return entry_price + distance
-    
-    def get_take_profit(self, entry_price: float, is_long: bool) -> float:
-        """Calculate take profit price."""
-        distance = self.atr * self.take_profit_atr_mult
-        if is_long:
-            return entry_price + distance
-        else:
-            return entry_price - distance
 
 
 class SignalGenerator:
     """
-    Generates trading signals by combining:
-    - Market calibration (lossless parameters)
-    - Feature engineering
-    - Ensemble model predictions
-    - Regime detection
-    - Alternative data (optional)
-    
-    Usage:
-        generator = SignalGenerator(
-            calibrator=calibrator,
-            feature_engineer=engineer,
-            ensemble=ensemble,
-            regime_detector=regime
-        )
-        
-        signal = generator.generate_signal("BTCUSD.x", df)
+    High-frequency multi-alpha signal generator.
+
+    Key change: Generate MORE signals, not fewer.
+    Each signal is smaller, but many compound to high returns.
     """
-    
-    def __init__(
-        self,
-        calibrator: MarketCalibrator,
-        feature_engineer: FeatureEngineer = None,
-        ensemble: EnsembleMetaLearner = None,
-        regime_detector: RegimeDetector = None,
-        min_confidence: float = 0.5,
-        recalibrate_hours: float = 4.0
-    ):
+
+    def __init__(self, min_confidence: float = 0.40):
         """
         Initialize signal generator.
 
         Args:
-            calibrator: MarketCalibrator for parameter derivation
-            feature_engineer: FeatureEngineer for indicator calculation
-            ensemble: EnsembleMetaLearner for predictions
-            regime_detector: RegimeDetector for regime classification
-            min_confidence: Minimum confidence for non-neutral signals
-            recalibrate_hours: Hours between recalibrations
+            min_confidence: Minimum confidence for a signal (default 0.40, lowered from 0.50)
         """
-        self.calibrator = calibrator
-        self.feature_engineer = feature_engineer
-        self.ensemble = ensemble
-        self.regime_detector = regime_detector or RegimeDetector()
+        self.multi_alpha = MultiAlphaEngine()
+        self.related_data_cache: Dict[str, pd.DataFrame] = {}
         self.min_confidence = min_confidence
-        self.recalibrate_hours = recalibrate_hours
 
-        # CRITICAL: Add trend filter to prevent counter-trend trades
-        self.trend_filter = TrendFilter()
-        self.min_confidence_trending = 0.4  # Lower threshold in trends
-        self.min_confidence_ranging = 0.6   # Higher threshold in ranges
+        # Track signal counts for monitoring
+        self.signal_counts = {
+            "long": 0,
+            "short": 0,
+            "neutral": 0
+        }
 
-        # Track blocked signals for monitoring
-        self.blocked_signals = {"counter_trend": 0, "low_confidence": 0}
-
-        # Cache
-        self._calibration_cache: Dict[str, FullCalibrationResult] = {}
-        self._last_calibration: Dict[str, datetime] = {}
-    
     def generate_signal(
         self,
-        symbol: str,
         df: pd.DataFrame,
-        alt_data: Dict[str, float] = None
+        symbol: str,
+        related_data: Dict[str, pd.DataFrame] = None,
+        calibration: Any = None
     ) -> TradingSignal:
         """
-        Generate complete trading signal for a symbol.
-
-        CRITICAL: Now applies trend filter to prevent counter-trend trades.
+        Generate multi-alpha signal.
 
         Args:
-            symbol: Trading symbol
             df: OHLCV DataFrame
-            alt_data: Optional alternative data signals
+            symbol: Trading symbol
+            related_data: Data for related symbols (for lead-lag strategy)
+            calibration: Optional calibration (ignored, for compatibility)
 
         Returns:
             TradingSignal with action, confidence, and risk parameters
         """
-        if len(df) < 100:
-            return self._neutral_signal(symbol, "Insufficient data")
+        # Get asset-specific parameters
+        params = get_params(symbol)
 
-        # 1. Calibrate parameters if needed
-        calibration = self._get_calibration(symbol, df)
-
-        # 2. Add features
-        if self.feature_engineer:
-            df = self.feature_engineer.add_all_features(df)
-
-        # 3. Detect regime
-        regime, regime_prob = self.regime_detector.detect_regime(df['close'].values)
-
-        # 4. CRITICAL: Analyze trend BEFORE generating signal
-        trend_state = self.trend_filter.analyze(df)
-
-        # 5. Prepare features for models
-        features = self._prepare_features(df, alt_data)
-
-        # 6. Get ensemble prediction (if available)
-        if self.ensemble:
-            try:
-                ensemble_pred = self.ensemble.predict(features)
-            except Exception as e:
-                logger.error(f"Ensemble prediction failed: {e}")
-                ensemble_pred = None
-        else:
-            ensemble_pred = None
-
-        # 7. Combine signals to get raw signal
-        raw_signal = self._combine_signals(
-            symbol=symbol,
-            df=df,
-            calibration=calibration,
-            regime=regime,
-            ensemble_pred=ensemble_pred,
-            alt_data=alt_data
-        )
-
-        # 8. Apply regime filter (existing)
-        raw_signal = self._apply_regime_filter(raw_signal, regime)
-
-        # 9. CRITICAL: Apply trend filter - THIS IS THE KEY FIX
-        filtered_action, conf_mult, filter_reason = self.trend_filter.filter_signal(
-            raw_signal.action,
-            trend_state,
-            regime
-        )
-
-        # Track blocked signals
-        if filter_reason == "counter_trend_blocked":
-            self.blocked_signals["counter_trend"] += 1
-            logger.info(f"BLOCKED {raw_signal.action.upper()} on {symbol} - "
-                       f"counter-trend in {trend_state.direction.value}")
-
-        # Adjust confidence threshold based on regime
-        if trend_state.is_trending:
-            min_conf = self.min_confidence_trending
-        else:
-            min_conf = self.min_confidence_ranging
-
-        # Apply confidence adjustment
-        adjusted_confidence = raw_signal.confidence * conf_mult
-
-        # Final decision
-        if filtered_action == "neutral" or adjusted_confidence < min_conf:
-            if raw_signal.action != "neutral" and adjusted_confidence < min_conf:
-                self.blocked_signals["low_confidence"] += 1
-
+        if len(df) < 50:
             return TradingSignal(
                 symbol=symbol,
                 action="neutral",
-                direction=0.0,
-                confidence=0.0,
-                position_scalar=0.0,
-                stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
-                take_profit_atr_mult=calibration.take_profit_atr_multiple,
-                regime=regime,
-                model_agreement=raw_signal.model_agreement,
-                trend_direction=trend_state.direction.value,
-                trend_strength=trend_state.strength,
-                higher_tf_aligned=trend_state.higher_tf_aligned,
-                filter_reason=filter_reason,
-                filters_applied=["trend_filter"],
-                calibration_confidence=calibration.confidence,
-                contributing_models=raw_signal.contributing_models,
-                current_price=raw_signal.current_price,
-                atr=raw_signal.atr,
+                entry_reason="insufficient_data"
             )
 
-        # Return filtered signal with trend info
-        return TradingSignal(
-            symbol=symbol,
-            action=filtered_action,
-            direction=raw_signal.direction,
-            confidence=adjusted_confidence,
-            position_scalar=raw_signal.position_scalar * conf_mult,
-            stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
-            take_profit_atr_mult=calibration.take_profit_atr_multiple,
-            regime=regime,
-            model_agreement=raw_signal.model_agreement,
-            trend_direction=trend_state.direction.value,
-            trend_strength=trend_state.strength,
-            higher_tf_aligned=trend_state.higher_tf_aligned,
-            filter_reason=filter_reason,
-            filters_applied=["trend_filter"],
-            calibration_confidence=calibration.confidence,
-            contributing_models=raw_signal.contributing_models,
-            current_price=raw_signal.current_price,
-            atr=raw_signal.atr,
+        # Use cached related data if none provided
+        data_for_leadlag = related_data or self.related_data_cache
+
+        # Generate combined signal from all strategies
+        combined = self.multi_alpha.generate_signals(
+            df,
+            symbol,
+            data_for_leadlag
         )
-    
-    def _get_calibration(
-        self,
-        symbol: str,
-        df: pd.DataFrame
-    ) -> FullCalibrationResult:
-        """Get or update calibration for symbol."""
-        now = datetime.now()
-        
-        # Check if recalibration needed
-        if symbol in self._last_calibration:
-            hours_since = (now - self._last_calibration[symbol]).total_seconds() / 3600
-            if hours_since < self.recalibrate_hours and symbol in self._calibration_cache:
-                return self._calibration_cache[symbol]
-        
-        # Recalibrate
-        try:
-            calibration = self.calibrator.calibrate_all(df)
-            self._calibration_cache[symbol] = calibration
-            self._last_calibration[symbol] = now
-            
-            # Update feature engineer if needed
-            if self.feature_engineer:
-                self.feature_engineer = FeatureEngineer.from_calibration(calibration)
-            
-            logger.info(f"Calibrated {symbol}: regime={calibration.current_regime}")
-            return calibration
-            
-        except Exception as e:
-            logger.error(f"Calibration failed for {symbol}: {e}")
-            
-            # Return cached if available
-            if symbol in self._calibration_cache:
-                return self._calibration_cache[symbol]
-            
-            # Return default calibration
-            return self.calibrator._calibrate_with_limited_data(df)
-    
-    def _prepare_features(
-        self,
-        df: pd.DataFrame,
-        alt_data: Dict[str, float] = None
-    ) -> Dict[str, np.ndarray]:
-        """Prepare features for model prediction."""
-        features = {}
-        
-        # General features for models
-        feature_cols = [
-            'returns', 'log_returns', 'volatility', 'atr', 'rsi',
-            'macd', 'macd_hist', 'bb_pct', 'volume_ratio',
-            'adx', 'trend_strength'
-        ]
-        
-        available_cols = [c for c in feature_cols if c in df.columns]
-        
-        if available_cols:
-            # Use last N rows
-            lookback = 50
-            feature_df = df[available_cols].iloc[-lookback:].copy()
-            feature_df = feature_df.fillna(0)
-            
-            features['general'] = feature_df.values
-            
-            # Specific features for different model types
-            features['mean_reversion'] = df['close'].values
-            features['regime'] = df['close'].values
-        
-        # Add alternative data
-        if alt_data:
-            features['alternative'] = np.array(list(alt_data.values()))
-        
-        return features
-    
-    def _combine_signals(
-        self,
-        symbol: str,
-        df: pd.DataFrame,
-        calibration: FullCalibrationResult,
-        regime: str,
-        ensemble_pred: Optional[EnsemblePrediction],
-        alt_data: Dict[str, float] = None
-    ) -> TradingSignal:
-        """Combine all signal sources into final signal."""
-        
-        # Get current market data
-        current_price = float(df['close'].iloc[-1])
-        atr = float(df['atr'].iloc[-1]) if 'atr' in df.columns else current_price * 0.02
-        
-        # Start with ensemble prediction
-        if ensemble_pred:
-            direction = ensemble_pred.direction
-            confidence = ensemble_pred.confidence
-            position_scalar = ensemble_pred.position_size_scalar
-            model_agreement = ensemble_pred.model_agreement
-            contributing = ensemble_pred.contributing_models
-        else:
-            # Fallback to simple signals from features
-            direction, confidence = self._simple_signal(df, calibration)
-            position_scalar = confidence
-            model_agreement = 1.0
-            contributing = ['technical']
-        
-        # Adjust with alternative data
-        if alt_data:
-            alt_direction = self._alt_data_signal(alt_data)
-            
-            # If alt data disagrees, reduce confidence
-            if np.sign(alt_direction) != np.sign(direction) and abs(alt_direction) > 0.3:
-                confidence *= 0.7
-                position_scalar *= 0.7
-            elif np.sign(alt_direction) == np.sign(direction):
-                # Agreement boosts confidence slightly
-                confidence = min(1.0, confidence * 1.1)
-        
-        # Determine action
-        if confidence < self.min_confidence or abs(direction) < 0.2:
-            action = "neutral"
-            position_scalar = 0.0
-        else:
-            action = "long" if direction > 0 else "short"
-        
+
+        # Calculate ATR and current price for the signal
+        close = df['close'].values
+        high = df['high'].values
+        low = df['low'].values
+        current_price = close[-1]
+        atr = self._calculate_atr(high, low, close, 14)
+
+        # Track signal counts
+        self.signal_counts[combined.action] += 1
+
+        if combined.action == "neutral":
+            return TradingSignal(
+                symbol=symbol,
+                action="neutral",
+                confidence=0.0,
+                entry_reason="no_signal",
+                current_price=current_price,
+                atr=atr
+            )
+
         return TradingSignal(
             symbol=symbol,
-            action=action,
-            direction=direction,
-            confidence=confidence,
-            position_scalar=position_scalar,
-            stop_loss_atr_mult=calibration.stop_loss_atr_multiple,
-            take_profit_atr_mult=calibration.take_profit_atr_multiple,
-            regime=regime,
-            model_agreement=model_agreement,
-            calibration_confidence=calibration.confidence,
-            contributing_models=contributing,
+            action=combined.action,
+            direction=combined.direction,
+            confidence=combined.confidence,
+            position_scalar=combined.position_size,
+            stop_loss=combined.stop_loss,
+            take_profit=combined.take_profit,
+            entry_reason=combined.entry_reason,
+            strategies_agreeing=combined.strategies_agreeing,
+            primary_strategy=combined.primary_strategy,
+            expected_holding=combined.expected_holding,
             current_price=current_price,
             atr=atr,
+            contributing_models=combined.strategies_agreeing
         )
-    
-    def _simple_signal(
+
+    def update_related_data(self, symbol: str, df: pd.DataFrame):
+        """Cache related symbol data for lead-lag strategy."""
+        self.related_data_cache[symbol] = df
+
+    def get_signal_stats(self) -> Dict[str, Any]:
+        """Get signal generation statistics."""
+        strategy_stats = self.multi_alpha.get_signal_stats()
+        return {
+            "signal_counts": self.signal_counts.copy(),
+            "strategy_signals": strategy_stats
+        }
+
+    def reset_stats(self):
+        """Reset all statistics."""
+        self.signal_counts = {
+            "long": 0,
+            "short": 0,
+            "neutral": 0
+        }
+        self.multi_alpha.reset_counts()
+
+    def _calculate_atr(
         self,
-        df: pd.DataFrame,
-        calibration: FullCalibrationResult
-    ) -> tuple:
-        """Generate simple signal from technical indicators."""
-        direction = 0.0
-        confidence = 0.0
-        signals = []
-        
-        # RSI signal
-        if 'rsi' in df.columns:
-            rsi = df['rsi'].iloc[-1]
-            if rsi < calibration.oversold_threshold:
-                signals.append(('rsi', 0.5, 0.6))
-            elif rsi > calibration.overbought_threshold:
-                signals.append(('rsi', -0.5, 0.6))
-        
-        # MACD signal
-        if 'macd_hist' in df.columns:
-            macd_hist = df['macd_hist'].iloc[-1]
-            if macd_hist > 0:
-                signals.append(('macd', 0.3, 0.5))
-            else:
-                signals.append(('macd', -0.3, 0.5))
-        
-        # Trend signal
-        if 'ma_cross' in df.columns:
-            ma_cross = df['ma_cross'].iloc[-1]
-            signals.append(('trend', ma_cross * 0.4, 0.4))
-        
-        if signals:
-            total_weight = sum(s[2] for s in signals)
-            direction = sum(s[1] * s[2] for s in signals) / total_weight
-            confidence = sum(s[2] for s in signals) / len(signals)
-        
-        return direction, confidence
-    
-    def _alt_data_signal(self, alt_data: Dict[str, float]) -> float:
-        """Extract signal from alternative data."""
-        direction = 0.0
-        
-        # Funding rate (contrarian)
-        if 'funding_rate' in alt_data:
-            funding = alt_data['funding_rate']
-            direction -= funding * 2  # Negative funding = long signal
-        
-        # Fear & Greed (contrarian at extremes)
-        if 'fear_greed' in alt_data:
-            fg = alt_data['fear_greed']
-            if fg < 25:  # Extreme fear = buy
-                direction += 0.3
-            elif fg > 75:  # Extreme greed = sell
-                direction -= 0.3
-        
-        return np.clip(direction, -1, 1)
-    
-    def _apply_regime_filter(
-        self,
-        signal: TradingSignal,
-        regime: str
-    ) -> TradingSignal:
-        """
-        Apply regime-based filters to the signal.
-        
-        - In trending regime: reduce mean-reversion signals
-        - In mean-reverting regime: reduce momentum signals
-        """
-        # Don't modify neutral signals
-        if signal.action == "neutral":
-            return signal
-        
-        # Reduce confidence in mismatched regime-strategy combinations
-        if regime in ['trending_up', 'trending_down']:
-            # In trending market, momentum signals are stronger
-            if 'mean_reversion' in signal.contributing_models:
-                signal.confidence *= 0.7
-                signal.position_scalar *= 0.7
-        
-        elif regime == 'mean_reverting':
-            # In MR market, trend signals are weaker
-            if 'trend' in signal.contributing_models:
-                signal.confidence *= 0.7
-                signal.position_scalar *= 0.7
-        
-        elif regime == 'high_volatility':
-            # Reduce all signals in high vol
-            signal.position_scalar *= 0.5
-        
-        # Re-check action threshold
-        if signal.confidence < self.min_confidence:
-            signal.action = "neutral"
-            signal.position_scalar = 0.0
-        
-        return signal
-    
-    def _neutral_signal(self, symbol: str, reason: str) -> TradingSignal:
-        """Return neutral signal."""
-        logger.debug(f"Neutral signal for {symbol}: {reason}")
-        
-        return TradingSignal(
-            symbol=symbol,
-            action="neutral",
-            direction=0.0,
-            confidence=0.0,
-            position_scalar=0.0,
-            stop_loss_atr_mult=2.0,
-            take_profit_atr_mult=3.0,
-            regime="unknown",
-            model_agreement=0.0,
-        )
+        high: np.ndarray,
+        low: np.ndarray,
+        close: np.ndarray,
+        period: int = 14
+    ) -> float:
+        """Calculate Average True Range."""
+        if len(high) < period + 1:
+            return high[-1] - low[-1] if len(high) > 0 else 0.0
+
+        tr_list = []
+        for i in range(-period, 0):
+            h_l = high[i] - low[i]
+            h_pc = abs(high[i] - close[i-1]) if i > -period else h_l
+            l_pc = abs(low[i] - close[i-1]) if i > -period else h_l
+            tr_list.append(max(h_l, h_pc, l_pc))
+
+        return np.mean(tr_list)
+
+    # Legacy compatibility methods
+    def get_blocked_stats(self) -> Dict[str, int]:
+        """Get statistics on blocked signals (legacy compatibility)."""
+        return {"no_signal": self.signal_counts["neutral"]}
+
+    # Additional property for compatibility with old code
+    @property
+    def blocked_signals(self) -> Dict[str, int]:
+        """Legacy compatibility for blocked_signals dict."""
+        return {"no_signal": self.signal_counts["neutral"]}
