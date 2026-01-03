@@ -8,6 +8,12 @@ Runs paper trading simulation across 4 prop firm accounts:
 
 Elite Portfolio: XAUUSD, XAGUSD, NAS100, UK100, SPX500, EURUSD
 
+Features:
+- Real-time signal generation and paper execution
+- Telegram notifications for trades and status
+- Compliance checking (GFT/The5ers rules)
+- Daily reports saved to logs/
+
 Usage:
     python scripts/start_paper_trading.py
 
@@ -20,6 +26,7 @@ import os
 import signal
 import sys
 import time
+import requests
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
@@ -37,6 +44,10 @@ from core.position_sizer import PositionSizer
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+# Telegram Configuration
+TELEGRAM_BOT_TOKEN = "8044940173:AAE6eEz3NjXxWaHkZq3nP903m2LHZAhuYjM"
+TELEGRAM_CHAT_IDS = [7898079111]
 
 # Account configurations
 ACCOUNTS = [
@@ -70,11 +81,158 @@ TIMEFRAME = "M15"
 BARS_TO_FETCH = 100
 SCAN_INTERVAL_SECONDS = 30  # Scan every 30 seconds
 STATUS_LOG_INTERVAL_SECONDS = 300  # Log status every 5 minutes
+TELEGRAM_STATUS_INTERVAL_SECONDS = 1800  # Telegram status every 30 minutes
 DAILY_REPORT_HOUR = 17  # 5 PM for daily report
 
 # Paths
 LOGS_DIR = "logs"
 STATE_DIR = "storage/state"
+
+
+# ============================================================================
+# TELEGRAM NOTIFIER
+# ============================================================================
+
+class TelegramNotifier:
+    """Simple Telegram notification sender."""
+
+    def __init__(self, bot_token: str, chat_ids: List[int]):
+        self.bot_token = bot_token
+        self.chat_ids = chat_ids
+        self.enabled = bool(bot_token and chat_ids)
+        self.logger = logging.getLogger('Telegram')
+
+        if not self.enabled:
+            self.logger.warning("Telegram notifications disabled (no token/chat_ids)")
+
+    def send(self, message: str, parse_mode: str = "HTML") -> bool:
+        """Send message to all configured chat IDs."""
+        if not self.enabled:
+            return False
+
+        success = True
+        for chat_id in self.chat_ids:
+            try:
+                url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+                payload = {
+                    "chat_id": chat_id,
+                    "text": message,
+                    "parse_mode": parse_mode,
+                    "disable_web_page_preview": True,
+                }
+                response = requests.post(url, json=payload, timeout=10)
+
+                if response.status_code != 200:
+                    self.logger.warning(f"Telegram send failed: {response.text}")
+                    success = False
+
+            except Exception as e:
+                self.logger.warning(f"Telegram error: {e}")
+                success = False
+
+        return success
+
+    def send_startup(self, accounts: List[Dict], symbols: List[str]):
+        """Send startup notification."""
+        total_balance = sum(a['initial_balance'] for a in accounts)
+
+        msg = (
+            "🚀 <b>SOVEREIGN V5 - PAPER TRADING STARTED</b>\n\n"
+            f"📊 <b>Accounts:</b>\n"
+        )
+        for acc in accounts:
+            msg += f"  • {acc['name']}: ${acc['initial_balance']:,.0f} ({acc['account_type']})\n"
+
+        msg += f"\n💰 <b>Total Capital:</b> ${total_balance:,.0f}\n"
+        msg += f"📈 <b>Symbols:</b> {', '.join(symbols)}\n"
+        msg += f"⏰ <b>Scan Interval:</b> {SCAN_INTERVAL_SECONDS}s\n"
+        msg += f"\n✅ Ready to trade!"
+
+        self.send(msg)
+
+    def send_shutdown(self, summary: Dict):
+        """Send shutdown notification with summary."""
+        msg = (
+            "🛑 <b>SOVEREIGN V5 - PAPER TRADING STOPPED</b>\n\n"
+            f"⏱ <b>Runtime:</b> {summary.get('runtime', 'N/A')}\n"
+            f"📊 <b>Signals:</b> {summary.get('total_signals', 0)}\n"
+            f"📈 <b>Trades:</b> {summary.get('total_trades', 0)}\n\n"
+        )
+
+        for name, data in summary.get('accounts', {}).items():
+            pnl = data.get('total_pnl', 0)
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            msg += f"{pnl_emoji} <b>{name}:</b> ${pnl:+,.2f}\n"
+
+        total_pnl = summary.get('total_pnl', 0)
+        total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        msg += f"\n{total_emoji} <b>Total P&L:</b> ${total_pnl:+,.2f}"
+
+        self.send(msg)
+
+    def send_trade_opened(self, account: str, symbol: str, direction: str,
+                          size: float, price: float, sl: float, tp: float):
+        """Send trade opened notification."""
+        emoji = "📈" if direction.upper() in ("LONG", "BUY") else "📉"
+        msg = (
+            f"{emoji} <b>TRADE OPENED</b>\n\n"
+            f"📊 <b>Account:</b> {account}\n"
+            f"💱 <b>Symbol:</b> {symbol}\n"
+            f"↗️ <b>Direction:</b> {direction.upper()}\n"
+            f"📏 <b>Size:</b> {size:.4f}\n"
+            f"💵 <b>Entry:</b> {price:.2f}\n"
+            f"🛑 <b>SL:</b> {sl:.2f}\n"
+            f"🎯 <b>TP:</b> {tp:.2f}"
+        )
+        self.send(msg)
+
+    def send_trade_closed(self, account: str, symbol: str, pnl: float, reason: str):
+        """Send trade closed notification."""
+        emoji = "✅" if pnl >= 0 else "❌"
+        msg = (
+            f"{emoji} <b>TRADE CLOSED</b>\n\n"
+            f"📊 <b>Account:</b> {account}\n"
+            f"💱 <b>Symbol:</b> {symbol}\n"
+            f"💰 <b>P&L:</b> ${pnl:+,.2f}\n"
+            f"📝 <b>Reason:</b> {reason}"
+        )
+        self.send(msg)
+
+    def send_status(self, accounts: Dict[str, AccountState], runtime: str):
+        """Send periodic status update."""
+        total_equity = sum(s.equity for s in accounts.values())
+        total_pnl = sum(s.realized_pnl + s.unrealized_pnl for s in accounts.values())
+        total_positions = sum(s.open_positions for s in accounts.values())
+
+        pnl_emoji = "🟢" if total_pnl >= 0 else "🔴"
+
+        msg = (
+            f"📊 <b>STATUS UPDATE</b>\n\n"
+            f"⏱ <b>Runtime:</b> {runtime}\n"
+            f"💰 <b>Total Equity:</b> ${total_equity:,.2f}\n"
+            f"{pnl_emoji} <b>Total P&L:</b> ${total_pnl:+,.2f}\n"
+            f"📈 <b>Open Positions:</b> {total_positions}\n\n"
+        )
+
+        for name, state in accounts.items():
+            dd_warning = "⚠️" if state.current_dd_pct > 3 else ""
+            msg += (
+                f"<b>{name}:</b> ${state.equity:,.0f} | "
+                f"DD: {state.current_dd_pct:.1f}% {dd_warning}\n"
+            )
+
+        self.send(msg)
+
+    def send_compliance_warning(self, account: str, warning: str, dd_pct: float):
+        """Send compliance warning."""
+        msg = (
+            f"⚠️ <b>COMPLIANCE WARNING</b>\n\n"
+            f"📊 <b>Account:</b> {account}\n"
+            f"⚠️ <b>Warning:</b> {warning}\n"
+            f"📉 <b>Drawdown:</b> {dd_pct:.2f}%\n\n"
+            f"🛑 Trading may be paused soon!"
+        )
+        self.send(msg)
 
 
 # ============================================================================
@@ -125,6 +283,7 @@ class PaperTradingRunner:
         self.signal_generator = SignalGenerator(min_confidence=0.40)
         self.position_sizer = PositionSizer()
         self.news_calendar = get_news_calendar()
+        self.telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
 
         # Initialize accounts
         self.executors: Dict[str, PaperExecutor] = {}
@@ -134,8 +293,10 @@ class PaperTradingRunner:
         self.running = True
         self.start_time = datetime.now()
         self.last_status_log = datetime.now()
+        self.last_telegram_status = datetime.now()
         self.last_daily_report = datetime.now().date()
-        self.total_signals = 0
+        self.total_signals = 0  # Only actionable signals (long/short)
+        self.neutral_signals = 0  # Neutral signals (for debugging)
         self.total_trades = 0
 
         # Price cache
@@ -176,9 +337,13 @@ class PaperTradingRunner:
         self.logger.info("[START] Paper trading started")
         self.logger.info(f"[CONFIG] Scan interval: {SCAN_INTERVAL_SECONDS}s")
         self.logger.info(f"[CONFIG] Status log interval: {STATUS_LOG_INTERVAL_SECONDS}s")
+        self.logger.info(f"[CONFIG] Telegram status interval: {TELEGRAM_STATUS_INTERVAL_SECONDS}s")
 
         # Refresh news calendar
         self.news_calendar.refresh()
+
+        # Send Telegram startup notification
+        self.telegram.send_startup(ACCOUNTS, SYMBOLS)
 
         scan_count = 0
 
@@ -198,6 +363,9 @@ class PaperTradingRunner:
 
                     # Log status periodically
                     self._maybe_log_status()
+
+                    # Send Telegram status periodically
+                    self._maybe_send_telegram_status()
 
                     # Save daily report
                     self._maybe_save_daily_report()
@@ -258,6 +426,10 @@ class PaperTradingRunner:
                         f"[{name}] Position closed: {pos.symbol} "
                         f"{pos.status.value} P&L=${pos.realized_pnl:+.2f}"
                     )
+                    # Send Telegram notification
+                    self.telegram.send_trade_closed(
+                        name, pos.symbol, pos.realized_pnl, pos.status.value
+                    )
 
     def _scan_for_signals(self):
         """Scan for trading signals across all symbols."""
@@ -272,26 +444,29 @@ class PaperTradingRunner:
                     continue
 
                 # Generate signal
-                signal = self.signal_generator.generate_signal(df, symbol)
-                self.total_signals += 1
+                sig = self.signal_generator.generate_signal(df, symbol)
 
                 # Check if actionable
-                if signal.action == "neutral":
+                if sig.action == "neutral":
+                    self.neutral_signals += 1
                     continue
 
+                # Count actionable signals
+                self.total_signals += 1
+
                 self.logger.info(
-                    f"[SIGNAL] {symbol}: {signal.action.upper()} "
-                    f"conf={signal.confidence:.2f} "
-                    f"reason={signal.entry_reason}"
+                    f"[SIGNAL] {symbol}: {sig.action.upper()} "
+                    f"conf={sig.confidence:.2f} "
+                    f"reason={sig.entry_reason}"
                 )
 
                 # Try to execute on each account
-                self._execute_signal(signal)
+                self._execute_signal(sig)
 
             except Exception as e:
                 self.logger.warning(f"Signal scan error for {symbol}: {e}")
 
-    def _execute_signal(self, signal: TradingSignal):
+    def _execute_signal(self, sig: TradingSignal):
         """Execute signal on all eligible accounts."""
         for name, executor in self.executors.items():
             try:
@@ -311,25 +486,25 @@ class PaperTradingRunner:
                     continue
 
                 # Check if we already have a position in this symbol
-                symbol_with_suffix = f"{signal.symbol}.x" if executor.account_type == "GFT" else signal.symbol
+                symbol_with_suffix = f"{sig.symbol}.x" if executor.account_type == "GFT" else sig.symbol
                 existing = [
                     p for p in executor.get_open_positions()
-                    if signal.symbol in p.symbol
+                    if sig.symbol in p.symbol
                 ]
                 if existing:
                     continue
 
                 # Calculate position size with compliance
-                current_price = signal.current_price
+                current_price = sig.current_price
                 if current_price <= 0:
-                    price_data = self.current_prices.get(signal.symbol, {})
+                    price_data = self.current_prices.get(sig.symbol, {})
                     current_price = price_data.get('close', 0)
 
                 if current_price <= 0:
                     continue
 
                 # Calculate stop distance
-                stop_distance = abs(current_price - signal.stop_loss) if signal.stop_loss else current_price * 0.01
+                stop_distance = abs(current_price - sig.stop_loss) if sig.stop_loss else current_price * 0.01
                 stop_distance_pct = (stop_distance / current_price) * 100
 
                 # Get compliant position size
@@ -337,10 +512,10 @@ class PaperTradingRunner:
                     account_balance=state.balance,
                     account_equity=state.equity,
                     stop_distance_pct=stop_distance_pct,
-                    signal_confidence=signal.confidence,
+                    signal_confidence=sig.confidence,
                     account_type=executor.account_type,
                     current_dd_pct=state.current_dd_pct,
-                    symbol=signal.symbol
+                    symbol=sig.symbol
                 )
 
                 if rejection:
@@ -351,19 +526,19 @@ class PaperTradingRunner:
                     continue
 
                 # Normalize position size (round to reasonable lot size)
-                position_size = self._normalize_size(signal.symbol, size_result['size'], current_price)
+                position_size = self._normalize_size(sig.symbol, size_result['size'], current_price)
 
                 if position_size <= 0:
                     continue
 
                 # Calculate stop loss and take profit
-                if signal.stop_loss and signal.take_profit:
-                    stop_loss = signal.stop_loss
-                    take_profit = signal.take_profit
+                if sig.stop_loss and sig.take_profit:
+                    stop_loss = sig.stop_loss
+                    take_profit = sig.take_profit
                 else:
                     # Default: 1.5 ATR stop, 3 ATR target
-                    atr = signal.atr if signal.atr > 0 else current_price * 0.01
-                    if signal.action == "long":
+                    atr = sig.atr if sig.atr > 0 else current_price * 0.01
+                    if sig.action == "long":
                         stop_loss = current_price - (atr * 1.5)
                         take_profit = current_price + (atr * 3.0)
                     else:
@@ -373,25 +548,30 @@ class PaperTradingRunner:
                 # Execute trade
                 success, msg, position = executor.open_position(
                     symbol=symbol_with_suffix,
-                    direction=signal.action,
+                    direction=sig.action,
                     size=position_size,
                     entry_price=current_price,
                     stop_loss=stop_loss,
                     take_profit=take_profit,
                     signal_info={
-                        "confidence": signal.confidence,
-                        "strategies": signal.strategies_agreeing,
-                        "primary": signal.primary_strategy,
+                        "confidence": sig.confidence,
+                        "strategies": sig.strategies_agreeing,
+                        "primary": sig.primary_strategy,
                     },
-                    comment=signal.entry_reason
+                    comment=sig.entry_reason
                 )
 
                 if success:
                     self.total_trades += 1
                     self.logger.info(
-                        f"[{name}] TRADE OPENED: {signal.action.upper()} {symbol_with_suffix} "
+                        f"[{name}] TRADE OPENED: {sig.action.upper()} {symbol_with_suffix} "
                         f"size={position_size:.4f} @ {current_price:.2f} "
                         f"SL={stop_loss:.2f} TP={take_profit:.2f}"
+                    )
+                    # Send Telegram notification
+                    self.telegram.send_trade_opened(
+                        name, symbol_with_suffix, sig.action,
+                        position_size, current_price, stop_loss, take_profit
                     )
                 else:
                     self.logger.warning(f"[{name}] Trade blocked: {msg}")
@@ -437,6 +617,17 @@ class PaperTradingRunner:
             self._log_status()
             self.last_status_log = now
 
+    def _maybe_send_telegram_status(self):
+        """Send Telegram status if interval has passed."""
+        now = datetime.now()
+        elapsed = (now - self.last_telegram_status).total_seconds()
+
+        if elapsed >= TELEGRAM_STATUS_INTERVAL_SECONDS:
+            states = {name: exec.get_account_state() for name, exec in self.executors.items()}
+            runtime = str(now - self.start_time).split('.')[0]
+            self.telegram.send_status(states, runtime)
+            self.last_telegram_status = now
+
     def _log_status(self):
         """Log current account status."""
         self.logger.info("-" * 60)
@@ -458,13 +649,21 @@ class PaperTradingRunner:
                 f"Pos: {state.open_positions}"
             )
 
+            # Check for compliance warnings
+            if state.current_dd_pct >= 4.0:
+                self.telegram.send_compliance_warning(
+                    name, "Drawdown approaching limit", state.current_dd_pct
+                )
+
         self.logger.info("-" * 60)
         self.logger.info(
             f"  TOTAL        | Equity: ${total_equity:>10,.2f} | "
             f"P&L: ${total_pnl:>+8,.2f}"
         )
         self.logger.info(
-            f"  Signals: {self.total_signals} | Trades: {self.total_trades} | "
+            f"  Signals: {self.total_signals} (actionable) | "
+            f"Neutral: {self.neutral_signals} | "
+            f"Trades: {self.total_trades} | "
             f"Runtime: {datetime.now() - self.start_time}"
         )
         self.logger.info("-" * 60)
@@ -486,6 +685,7 @@ class PaperTradingRunner:
             "date": datetime.now().isoformat(),
             "runtime_hours": (datetime.now() - self.start_time).total_seconds() / 3600,
             "total_signals": self.total_signals,
+            "neutral_signals": self.neutral_signals,
             "total_trades": self.total_trades,
             "accounts": {}
         }
@@ -543,7 +743,8 @@ class PaperTradingRunner:
         self.logger.info(f"  Start Time:     {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"  End Time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"  Runtime:        {runtime}")
-        self.logger.info(f"  Total Signals:  {self.total_signals}")
+        self.logger.info(f"  Total Signals:  {self.total_signals} (actionable)")
+        self.logger.info(f"  Neutral Signals: {self.neutral_signals}")
         self.logger.info(f"  Total Trades:   {self.total_trades}")
         self.logger.info("=" * 60)
 
@@ -551,6 +752,15 @@ class PaperTradingRunner:
         total_equity = 0
         total_realized = 0
         total_unrealized = 0
+
+        # Build summary for Telegram
+        summary = {
+            "runtime": str(runtime).split('.')[0],
+            "total_signals": self.total_signals,
+            "total_trades": self.total_trades,
+            "accounts": {},
+            "total_pnl": 0,
+        }
 
         for name, executor in self.executors.items():
             state = executor.get_account_state()
@@ -562,6 +772,8 @@ class PaperTradingRunner:
 
             pnl = state.realized_pnl + state.unrealized_pnl
             pnl_pct = (pnl / state.initial_balance) * 100
+
+            summary["accounts"][name] = {"total_pnl": pnl}
 
             self.logger.info(f"\n  [{name}] ({executor.account_type})")
             self.logger.info(f"  {'─' * 40}")
@@ -590,6 +802,7 @@ class PaperTradingRunner:
         # Summary
         total_pnl = total_realized + total_unrealized
         total_pnl_pct = (total_pnl / total_initial) * 100 if total_initial > 0 else 0
+        summary["total_pnl"] = total_pnl
 
         self.logger.info("\n" + "=" * 60)
         self.logger.info("  COMBINED SUMMARY")
@@ -603,6 +816,9 @@ class PaperTradingRunner:
 
         # Save final report
         self._save_daily_report()
+
+        # Send Telegram shutdown notification
+        self.telegram.send_shutdown(summary)
 
         self.logger.info("\n[END] Paper trading session complete")
 
