@@ -28,8 +28,9 @@ logger = logging.getLogger(__name__)
 SYMBOL_SIZE_MULTIPLIER = {
     'XAUUSD': 1.2,   # Sharpe 2.70 - increase size 20%
     'NAS100': 1.15,  # Sharpe 1.54 - increase size 15%
+    'SPX500': 1.1,   # Sharpe 1.09 - increase size 10%
     'EURUSD': 1.0,   # Sharpe 0.90 - keep normal
-    'BTCUSD': 0.7,   # Sharpe 0.19 - REDUCE size 30%
+    'BTCUSD': 0.7,   # Sharpe 0.19 - REDUCE size 30% (if used)
 }
 
 
