@@ -278,6 +278,7 @@ class PaperExecutor:
             self.max_total_dd_pct = 6.0
             self.guardian_total_dd_pct = 5.0
             self.daily_profit_cap = 3000.0
+            self.min_trade_duration_seconds = 120  # 2 min minimum for GFT
         else:  # THE5ERS
             self.max_floating_loss_pct = 10.0  # No per-trade limit
             self.guardian_floating_pct = 10.0
@@ -286,6 +287,7 @@ class PaperExecutor:
             self.max_total_dd_pct = 10.0
             self.guardian_total_dd_pct = 8.0
             self.daily_profit_cap = float('inf')
+            self.min_trade_duration_seconds = 0  # No min for The5ers
 
     def open_position(
         self,
@@ -419,6 +421,20 @@ class PaperExecutor:
                 del self.open_positions[pos_id]
                 closed.append(pos)
                 self._update_balance(pnl)
+
+                # Check 2-minute trade duration rule (GFT)
+                trade_duration = (pos.exit_time - pos.entry_time).total_seconds()
+                if self.min_trade_duration_seconds > 0 and trade_duration < self.min_trade_duration_seconds:
+                    if pnl > 0:
+                        logger.warning(
+                            f"[{self.account_name}] WARNING: Trade closed in {trade_duration:.0f}s "
+                            f"(min {self.min_trade_duration_seconds}s). Profit ${pnl:.2f} would be DEDUCTED by GFT!"
+                        )
+                    else:
+                        logger.warning(
+                            f"[{self.account_name}] WARNING: Trade closed in {trade_duration:.0f}s "
+                            f"(min {self.min_trade_duration_seconds}s). Loss ${pnl:.2f} still counts!"
+                        )
 
                 logger.info(
                     f"[{self.account_name}] PAPER CLOSE: {pos.symbol} "
