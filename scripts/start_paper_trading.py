@@ -40,6 +40,13 @@ from signals.generator import SignalGenerator, TradingSignal
 from core.news_calendar import get_news_calendar
 from core.position_sizer import PositionSizer
 
+# Crypto module imports
+try:
+    from crypto import CryptoStrategyEngine, CryptoRegimeDetector
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
 # MT5 imports (optional - for real data)
 try:
     from core.mt5_connector import MT5Connector, MT5Credentials
@@ -91,9 +98,17 @@ ACCOUNTS = [
 # Elite Portfolio - Top 6 by Sharpe ratio (use .x suffix for GFT broker)
 SYMBOLS = ["XAUUSD.x", "XAGUSD.x", "NAS100.x", "UK100.x", "SPX500.x", "EURUSD.x"]
 
+# Crypto symbols for The5ers 24/7 trading (no suffix needed)
+CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]
+
+# Combined symbols for The5ers (trades both forex/indices AND crypto)
+THE5ERS_SYMBOLS = ["XAUUSD", "XAGUSD", "NAS100", "UK100", "SPX500", "EURUSD", "BTCUSD", "ETHUSD"]
+
 # Trading parameters
 TIMEFRAME = "M15"
+CRYPTO_TIMEFRAME = "H1"  # Use 1H for crypto (less noise)
 BARS_TO_FETCH = 100
+CRYPTO_BARS_TO_FETCH = 200  # More bars for crypto (need 4H data too)
 SCAN_INTERVAL_SECONDS = 30  # Scan every 30 seconds
 STATUS_LOG_INTERVAL_SECONDS = 300  # Log status every 5 minutes
 TELEGRAM_STATUS_INTERVAL_SECONDS = 1800  # Telegram status every 30 minutes
@@ -508,6 +523,12 @@ class PaperTradingRunner:
         self.telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
         self.telegram.runner = self  # Enable command handling
 
+        # Initialize crypto strategy engine for The5ers 24/7 trading
+        self.crypto_engine = None
+        if CRYPTO_AVAILABLE:
+            self.crypto_engine = CryptoStrategyEngine(account_balance=5000.0)
+            self.logger.info("[CRYPTO] Crypto strategy engine initialized for The5ers")
+
         # Initialize accounts
         self.executors: Dict[str, PaperExecutor] = {}
         self._init_accounts()
@@ -762,6 +783,141 @@ class PaperTradingRunner:
 
             except Exception as e:
                 self.logger.warning(f"Signal scan error for {symbol}: {e}")
+
+        # Scan crypto symbols for The5ers (24/7 trading)
+        if self.crypto_engine and CRYPTO_AVAILABLE:
+            self._scan_crypto_signals()
+
+    def _scan_crypto_signals(self):
+        """Scan for crypto signals for The5ers account (24/7 trading)."""
+        for symbol in CRYPTO_SYMBOLS:
+            try:
+                # Crypto trades 24/7 - no market hours check needed
+
+                # Get 1H data for primary signal
+                df_1h = self.data_fetcher.get_historical_bars(
+                    symbol, CRYPTO_TIMEFRAME, CRYPTO_BARS_TO_FETCH
+                )
+
+                if df_1h.empty or len(df_1h) < 100:
+                    continue
+
+                # Get 4H data for trend confirmation (resample from 1H)
+                df_4h = df_1h.resample('4h', on='time').agg({
+                    'open': 'first',
+                    'high': 'max',
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                }).dropna().reset_index() if 'time' in df_1h.columns else df_1h.iloc[::4]
+
+                if len(df_4h) < 25:
+                    # Not enough 4H data, use 1H only
+                    df_4h = df_1h
+
+                # Get The5ers account state
+                the5ers_executor = self.executors.get("THE5ERS_1")
+                if not the5ers_executor:
+                    continue
+
+                state = the5ers_executor.get_account_state()
+
+                # Check if we already have max crypto positions (2)
+                crypto_positions = [
+                    p for p in the5ers_executor.get_open_positions()
+                    if any(crypto in p.symbol.upper() for crypto in ['BTC', 'ETH'])
+                ]
+                if len(crypto_positions) >= 2:
+                    continue
+
+                # Check cooldown
+                now = datetime.now()
+                last_signal = self.last_signal_time.get(symbol)
+                if last_signal:
+                    cooldown_remaining = (now - last_signal).total_seconds()
+                    if cooldown_remaining < SIGNAL_COOLDOWN_SECONDS * 2:  # Longer cooldown for crypto
+                        continue
+
+                # Generate crypto signal
+                crypto_signal = self.crypto_engine.generate_signal(
+                    df_1h=df_1h,
+                    df_4h=df_4h,
+                    symbol=symbol,
+                    current_equity=state.equity
+                )
+
+                if crypto_signal.action == "neutral":
+                    self.neutral_signals += 1
+                    continue
+
+                # Update cooldown timer
+                self.last_signal_time[symbol] = now
+                self.total_signals += 1
+
+                self.logger.info(
+                    f"[CRYPTO] {symbol}: {crypto_signal.action.upper()} "
+                    f"conf={crypto_signal.confidence:.2f} "
+                    f"regime={crypto_signal.regime.value} "
+                    f"reason={crypto_signal.reason}"
+                )
+
+                # Execute on The5ers account only
+                self._execute_crypto_signal(crypto_signal, the5ers_executor, state)
+
+            except Exception as e:
+                self.logger.warning(f"Crypto scan error for {symbol}: {e}")
+
+    def _execute_crypto_signal(self, sig, executor: PaperExecutor, state: AccountState):
+        """Execute crypto signal on The5ers account."""
+        try:
+            # Check if we already have a position in this symbol
+            existing = [
+                p for p in executor.get_open_positions()
+                if sig.symbol in p.symbol.upper()
+            ]
+            if existing:
+                return
+
+            # Position size already calculated by crypto engine
+            if sig.position_size <= 0:
+                return
+
+            # Execute trade
+            success, msg, position = executor.open_position(
+                symbol=sig.symbol,
+                direction=sig.action,
+                size=sig.position_size,
+                entry_price=sig.entry_price,
+                stop_loss=sig.stop_loss,
+                take_profit=sig.take_profit,
+                signal_info={
+                    "confidence": sig.confidence,
+                    "regime": sig.regime.value,
+                    "signal_type": sig.signal_type.value,
+                    "confirmations": sig.confirmations,
+                },
+                comment=sig.reason
+            )
+
+            if success:
+                self.total_trades += 1
+                self.logger.info(
+                    f"[THE5ERS_1] CRYPTO TRADE OPENED: {sig.action.upper()} {sig.symbol} "
+                    f"size={sig.position_size:.4f} @ {sig.entry_price:.2f} "
+                    f"SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
+                )
+                # Send Telegram notification
+                self.telegram.send_trade_opened(
+                    "THE5ERS_1", sig.symbol, sig.action,
+                    sig.position_size, sig.entry_price, sig.stop_loss, sig.take_profit,
+                    risk_amount=sig.risk_amount,
+                    risk_pct=sig.risk_pct * 100
+                )
+            else:
+                self.logger.warning(f"[THE5ERS_1] Crypto trade blocked: {msg}")
+
+        except Exception as e:
+            self.logger.error(f"[THE5ERS_1] Crypto execution error: {e}", exc_info=True)
 
     def _execute_signal(self, sig: TradingSignal):
         """Execute signal on all eligible accounts."""
