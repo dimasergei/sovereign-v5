@@ -14,7 +14,7 @@ CRITICAL RULES (DO NOT MODIFY) - As of 2024:
 - Min trading days: 5 @ 0.5% profit each for payout
 - No hedging, martingale, or HFT
 - Max inactivity: 30 days
-- Crypto CFDs only
+- CFDs (Gold, Silver, Indices, Forex)
 
 WARNING: The 2% per-trade floating loss limit is the most dangerous rule.
 It causes IMMEDIATE account closure if breached. We monitor this every second.
@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     'MT5_PATH': r'C:\Program Files\MetaTrader 5\terminal64.exe',
     'TELEGRAM_TOKEN': '',
     'TELEGRAM_CHAT_IDS': [],
-    'SYMBOLS': ['BTCUSD.x', 'ETHUSD.x', 'SOLUSD.x', 'XRPUSD.x', 'LTCUSD.x'],
+    'SYMBOLS': ['XAUUSD.x', 'XAGUSD.x', 'NAS100.x', 'UK100.x', 'SPX500.x', 'EURUSD.x'],
     'TIMEFRAME': 'M5',
     'SCAN_INTERVAL': 60,
     'MAX_DRAWDOWN_PERCENT': 5.0,
