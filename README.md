@@ -191,13 +191,13 @@ sovereign-v5/
 
 | Rule | Limit | Guardian | Action if Breached |
 |------|-------|----------|-------------------|
-| **Daily Loss** | 4% | 3.5% | Stop trading for day |
+| **Daily Loss** | 3% | 2.5% | Stop trading for day |
 | **Total Drawdown** | 6% (trailing) | 5% | Stop all trading |
 | **Floating Loss** | 2% combined | 1.8% | **INSTANT ACCOUNT CLOSURE** |
 | **Trade Duration** | 2 minutes minimum | - | Profits deducted if <2min |
 | **Risk Per Trade** | 2% per instrument | 1.5% | Block trade |
 | **Consistency** | No day >15% of profits | - | Blocks payout only |
-| **Inactivity** | 60 days | 50 days | Account closure |
+| **Inactivity** | 30 days | 25 days | Account closure |
 | **Leverage** | 1:30 all assets | - | - |
 
 **CRITICAL:** The 2% floating loss rule causes INSTANT account termination. The system monitors this every tick.
@@ -487,13 +487,13 @@ TELEGRAM_CHAT_IDS = [your_chat_id]
 SYMBOLS = ["XAUUSD.x", "XAGUSD.x", "NAS100.x", "UK100.x", "SPX500.x", "EURUSD.x"]
 
 # Compliance Limits
-MAX_DAILY_DD_PCT = 4.0
+MAX_DAILY_DD_PCT = 3.0
 MAX_TOTAL_DD_PCT = 6.0
 MAX_FLOATING_LOSS_PCT = 2.0
 MIN_TRADE_DURATION_SECONDS = 120
 
 # Guardian Limits (stop before breach)
-GUARDIAN_DAILY_DD_PCT = 3.5
+GUARDIAN_DAILY_DD_PCT = 2.5
 GUARDIAN_TOTAL_DD_PCT = 5.0
 GUARDIAN_FLOATING_PCT = 1.8
 ```
@@ -544,7 +544,7 @@ pip install MetaTrader5
 - Market may be closed
 
 **"Daily DD guardian triggered"**
-- Account hit 2.5% daily loss
+- Account hit 2.5% daily loss (guardian limit, actual is 3%)
 - Trading paused until next day (5 PM EST reset)
 - Reset: `del storage\state\*.json`
 
