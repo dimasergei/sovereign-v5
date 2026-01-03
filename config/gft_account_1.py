@@ -38,6 +38,9 @@ GUARDIAN_FLOATING_PCT = 1.8   # Close position at 1.8% floating loss
 # News blackout
 NEWS_BLACKOUT_MINUTES = 5     # Block trades +/- 5 min of high-impact news
 
+# Trade duration
+MIN_TRADE_DURATION_SECONDS = 120  # 2 min minimum - profits deducted if closed earlier!
+
 # Leverage limits
 LEVERAGE = {"forex": 50, "indices": 10, "commodities": 10}
 

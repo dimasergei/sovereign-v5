@@ -85,6 +85,7 @@ class GFTComplianceChecker:
     # Other limits
     DAILY_PROFIT_CAP_USD = 3000
     NEWS_BLACKOUT_MINUTES = 5
+    MIN_TRADE_DURATION_SECONDS = 120  # 2 minutes - profits deducted if closed earlier
     MIN_PROFITABLE_DAYS = 5
     PROFITABLE_DAY_THRESHOLD_PCT = 0.5
     CONSISTENCY_MAX_SINGLE_DAY_PCT = 15.0
@@ -480,6 +481,53 @@ class GFTComplianceChecker:
             )
 
         return ComplianceResult(action=ComplianceAction.OK, reason="Activity within limits")
+
+    def check_trade_duration(
+        self,
+        trade_open_time: datetime,
+        current_time: Optional[datetime] = None
+    ) -> ComplianceResult:
+        """
+        Check if trade meets minimum 2-minute duration requirement.
+
+        GFT Rule: Trades must be held for at least 2 minutes (120 seconds).
+        - Profits from trades closed in less than 2 minutes are DEDUCTED
+        - Losses from such trades are still counted
+
+        Args:
+            trade_open_time: When the trade was opened
+            current_time: Current time (defaults to now)
+
+        Returns:
+            ComplianceResult - BLOCK_TRADE if too early to close
+        """
+        if current_time is None:
+            current_time = datetime.now()
+
+        duration_seconds = (current_time - trade_open_time).total_seconds()
+        remaining_seconds = self.MIN_TRADE_DURATION_SECONDS - duration_seconds
+
+        if remaining_seconds > 0:
+            logger.warning(
+                f"[{self.account_name}] Trade duration violation: "
+                f"{duration_seconds:.0f}s < {self.MIN_TRADE_DURATION_SECONDS}s minimum. "
+                f"Wait {remaining_seconds:.0f}s more."
+            )
+            return ComplianceResult(
+                action=ComplianceAction.BLOCK_TRADE,
+                reason=f"Trade must be held for {self.MIN_TRADE_DURATION_SECONDS}s. "
+                       f"Wait {remaining_seconds:.0f}s more.",
+                details={
+                    "duration_seconds": duration_seconds,
+                    "min_duration": self.MIN_TRADE_DURATION_SECONDS,
+                    "remaining_seconds": remaining_seconds
+                }
+            )
+
+        return ComplianceResult(
+            action=ComplianceAction.OK,
+            reason=f"Trade duration OK ({duration_seconds:.0f}s)"
+        )
 
     def get_leverage_limit(self, asset_class: str) -> int:
         """
