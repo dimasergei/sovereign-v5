@@ -553,6 +553,46 @@ class PaperTradingRunner:
         self.logger.info(f"  Symbols: {', '.join(SYMBOLS)}")
         self.logger.info("=" * 60)
 
+    def _is_crypto(self, symbol: str) -> bool:
+        """Check if symbol is a cryptocurrency (trades 24/7)."""
+        crypto_patterns = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'DOT', 'AVAX', 'MATIC', 'LTC', 'BNB', 'DOGE', 'SHIB']
+        upper = symbol.upper()
+        return any(pattern in upper for pattern in crypto_patterns)
+
+    def _is_market_open(self, symbol: str) -> bool:
+        """
+        Check if market is open for the given symbol.
+
+        Crypto: Always open (24/7)
+        Forex/Indices: Sunday 5 PM EST to Friday 5 PM EST
+        """
+        # Crypto trades 24/7
+        if self._is_crypto(symbol):
+            return True
+
+        # Get current time in EST (UTC-5)
+        from datetime import timezone
+        utc_now = datetime.now(timezone.utc)
+        est_offset = timedelta(hours=-5)
+        est_now = utc_now + est_offset
+
+        weekday = est_now.weekday()  # Monday=0, Sunday=6
+        hour = est_now.hour
+
+        # Market closed: Saturday all day
+        if weekday == 5:  # Saturday
+            return False
+
+        # Market closed: Sunday before 5 PM EST
+        if weekday == 6 and hour < 17:  # Sunday before 5 PM
+            return False
+
+        # Market closed: Friday after 5 PM EST
+        if weekday == 4 and hour >= 17:  # Friday after 5 PM
+            return False
+
+        return True
+
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         self.logger.info("\n[SHUTDOWN] Received signal, stopping gracefully...")
@@ -564,6 +604,16 @@ class PaperTradingRunner:
         self.logger.info(f"[CONFIG] Scan interval: {SCAN_INTERVAL_SECONDS}s")
         self.logger.info(f"[CONFIG] Status log interval: {STATUS_LOG_INTERVAL_SECONDS}s")
         self.logger.info(f"[CONFIG] Telegram status interval: {TELEGRAM_STATUS_INTERVAL_SECONDS}s")
+
+        # Log market status for each symbol
+        open_symbols = [s for s in SYMBOLS if self._is_market_open(s)]
+        closed_symbols = [s for s in SYMBOLS if not self._is_market_open(s)]
+        if closed_symbols:
+            self.logger.warning(f"[MARKET] Closed: {', '.join(closed_symbols)}")
+        if open_symbols:
+            self.logger.info(f"[MARKET] Open: {', '.join(open_symbols)}")
+        else:
+            self.logger.warning("[MARKET] All markets closed - no trading until markets reopen")
 
         # Refresh news calendar
         self.news_calendar.refresh()
@@ -664,6 +714,10 @@ class PaperTradingRunner:
         """Scan for trading signals across all symbols."""
         for symbol in SYMBOLS:
             try:
+                # Skip if market is closed (except crypto which trades 24/7)
+                if not self._is_market_open(symbol):
+                    continue
+
                 # Get data for signal generation
                 df = self.data_fetcher.get_historical_bars(
                     symbol, TIMEFRAME, BARS_TO_FETCH
