@@ -90,17 +90,19 @@ STATE_DIR = "storage/state"
 
 
 # ============================================================================
-# TELEGRAM NOTIFIER
+# TELEGRAM NOTIFIER WITH COMMAND HANDLING
 # ============================================================================
 
 class TelegramNotifier:
-    """Simple Telegram notification sender."""
+    """Telegram notification sender with command handling."""
 
     def __init__(self, bot_token: str, chat_ids: List[int]):
         self.bot_token = bot_token
         self.chat_ids = chat_ids
         self.enabled = bool(bot_token and chat_ids)
         self.logger = logging.getLogger('Telegram')
+        self.last_update_id = 0
+        self.runner = None  # Will be set by PaperTradingRunner
 
         if not self.enabled:
             self.logger.warning("Telegram notifications disabled (no token/chat_ids)")
@@ -234,6 +236,177 @@ class TelegramNotifier:
         )
         self.send(msg)
 
+    def check_commands(self):
+        """Check for incoming Telegram commands and process them."""
+        if not self.enabled or not self.runner:
+            return
+
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+            params = {"offset": self.last_update_id + 1, "timeout": 1}
+            response = requests.get(url, params=params, timeout=5)
+
+            if response.status_code != 200:
+                return
+
+            data = response.json()
+            if not data.get("ok"):
+                return
+
+            for update in data.get("result", []):
+                self.last_update_id = update["update_id"]
+                message = update.get("message", {})
+                chat_id = message.get("chat", {}).get("id")
+                text = message.get("text", "").strip()
+
+                # Only respond to authorized chat IDs
+                if chat_id not in self.chat_ids:
+                    continue
+
+                # Process commands
+                if text.startswith("/"):
+                    self._handle_command(text, chat_id)
+
+        except Exception as e:
+            pass  # Silently ignore polling errors
+
+    def _handle_command(self, text: str, chat_id: int):
+        """Handle a Telegram command."""
+        command = text.split()[0].lower()
+
+        if command == "/status":
+            self._cmd_status(chat_id)
+        elif command == "/positions":
+            self._cmd_positions(chat_id)
+        elif command == "/trades":
+            self._cmd_trades(chat_id)
+        elif command == "/help":
+            self._cmd_help(chat_id)
+        elif command == "/ping":
+            self._send_to(chat_id, "🏓 <b>Pong!</b> Bot is running.")
+
+    def _send_to(self, chat_id: int, message: str):
+        """Send message to specific chat ID."""
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            payload = {
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            requests.post(url, json=payload, timeout=10)
+        except Exception:
+            pass
+
+    def _cmd_help(self, chat_id: int):
+        """Send help message."""
+        msg = (
+            "📖 <b>SOVEREIGN V5 COMMANDS</b>\n\n"
+            "/status - Account summary & P&L\n"
+            "/positions - Open positions\n"
+            "/trades - Recent trade history\n"
+            "/ping - Check if bot is running\n"
+            "/help - Show this help"
+        )
+        self._send_to(chat_id, msg)
+
+    def _cmd_status(self, chat_id: int):
+        """Send status summary."""
+        if not self.runner:
+            self._send_to(chat_id, "❌ Runner not initialized")
+            return
+
+        runtime = str(datetime.now() - self.runner.start_time).split('.')[0]
+        total_equity = 0
+        total_pnl = 0
+        total_positions = 0
+
+        msg = f"📊 <b>ACCOUNT STATUS</b>\n\n"
+        msg += f"⏱ <b>Runtime:</b> {runtime}\n\n"
+
+        for name, executor in self.runner.executors.items():
+            state = executor.get_account_state()
+            pnl = state.realized_pnl + state.unrealized_pnl
+            total_equity += state.equity
+            total_pnl += pnl
+            total_positions += state.open_positions
+
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            dd_warn = " ⚠️" if state.current_dd_pct > 3 else ""
+
+            msg += (
+                f"{emoji} <b>{name}</b>\n"
+                f"   Equity: ${state.equity:,.0f} | P&L: ${pnl:+,.0f}\n"
+                f"   DD: {state.current_dd_pct:.1f}%{dd_warn} | Pos: {state.open_positions}\n\n"
+            )
+
+        total_emoji = "🟢" if total_pnl >= 0 else "🔴"
+        msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+        msg += f"{total_emoji} <b>TOTAL:</b> ${total_equity:,.0f}\n"
+        msg += f"💰 <b>P&L:</b> ${total_pnl:+,.2f}\n"
+        msg += f"📈 <b>Positions:</b> {total_positions}\n"
+        msg += f"📊 <b>Signals:</b> {self.runner.total_signals} | <b>Trades:</b> {self.runner.total_trades}"
+
+        self._send_to(chat_id, msg)
+
+    def _cmd_positions(self, chat_id: int):
+        """Send open positions."""
+        if not self.runner:
+            self._send_to(chat_id, "❌ Runner not initialized")
+            return
+
+        msg = "📈 <b>OPEN POSITIONS</b>\n\n"
+        total_positions = 0
+
+        for name, executor in self.runner.executors.items():
+            positions = executor.get_open_positions()
+            if not positions:
+                continue
+
+            msg += f"<b>{name}</b>\n"
+            for pos in positions:
+                total_positions += 1
+                emoji = "📈" if pos.direction.upper() == "LONG" else "📉"
+                msg += (
+                    f"  {emoji} {pos.symbol}\n"
+                    f"     {pos.direction.upper()} x{pos.size:.2f} @ {pos.entry_price:.2f}\n"
+                    f"     P&L: ${pos.unrealized_pnl:+,.2f}\n"
+                )
+            msg += "\n"
+
+        if total_positions == 0:
+            msg += "No open positions."
+
+        self._send_to(chat_id, msg)
+
+    def _cmd_trades(self, chat_id: int):
+        """Send recent trades."""
+        if not self.runner:
+            self._send_to(chat_id, "❌ Runner not initialized")
+            return
+
+        msg = "📜 <b>RECENT TRADES</b>\n\n"
+        all_trades = []
+
+        for name, executor in self.runner.executors.items():
+            history = executor.get_trade_history()
+            for trade in history[-3:]:  # Last 3 per account
+                all_trades.append((name, trade))
+
+        if not all_trades:
+            msg += "No closed trades yet."
+        else:
+            # Show last 10 overall
+            for name, trade in all_trades[-10:]:
+                emoji = "✅" if trade.realized_pnl >= 0 else "❌"
+                msg += (
+                    f"{emoji} <b>{name}</b> | {trade.symbol}\n"
+                    f"   {trade.direction.upper()} | P&L: ${trade.realized_pnl:+,.2f}\n\n"
+                )
+
+        self._send_to(chat_id, msg)
+
 
 # ============================================================================
 # LOGGING SETUP
@@ -284,6 +457,7 @@ class PaperTradingRunner:
         self.position_sizer = PositionSizer()
         self.news_calendar = get_news_calendar()
         self.telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
+        self.telegram.runner = self  # Enable command handling
 
         # Initialize accounts
         self.executors: Dict[str, PaperExecutor] = {}
@@ -369,6 +543,9 @@ class PaperTradingRunner:
 
                     # Save daily report
                     self._maybe_save_daily_report()
+
+                    # Check for Telegram commands
+                    self.telegram.check_commands()
 
                 except Exception as e:
                     self.logger.error(f"[ERROR] Scan error: {e}", exc_info=True)
