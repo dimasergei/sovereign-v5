@@ -971,7 +971,7 @@ class PaperTradingRunner:
             summary["accounts"][name] = {"total_pnl": pnl}
 
             self.logger.info(f"\n  [{name}] ({executor.account_type})")
-            self.logger.info(f"  {'─' * 40}")
+            self.logger.info(f"  {'-' * 40}")
             self.logger.info(f"  Initial Balance:  ${state.initial_balance:>10,.2f}")
             self.logger.info(f"  Current Balance:  ${state.balance:>10,.2f}")
             self.logger.info(f"  Current Equity:   ${state.equity:>10,.2f}")
