@@ -6,10 +6,14 @@ Key insight: Many small positions, not few large ones.
 Max risk per trade: 0.5% (allows for more positions simultaneously)
 
 Target: 4-6 simultaneous positions with 0.5% risk each
+
+COMPLIANCE INTEGRATION:
+- GFT: Max 2% risk per trade, stop distance must not breach -2% floating loss
+- The5ers: More flexible, but respects daily loss limits
 """
 
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 import logging
 
@@ -322,3 +326,114 @@ class PositionSizer:
             "avg_loss": self.total_losses / self.loss_count if self.loss_count > 0 else 0,
             "kelly": self._calculate_kelly()
         }
+
+    def calculate_with_compliance(
+        self,
+        account_balance: float,
+        account_equity: float,
+        stop_distance_pct: float,
+        signal_confidence: float,
+        account_type: str = "GFT",
+        current_dd_pct: float = 0.0,
+        symbol: str = None
+    ) -> Tuple[Dict, str]:
+        """
+        Calculate position size with prop firm compliance checks.
+
+        CRITICAL: This method enforces prop firm rules to prevent breaches.
+
+        Args:
+            account_balance: Current account balance
+            account_equity: Current account equity
+            stop_distance_pct: Stop loss distance as percentage of entry
+            signal_confidence: Signal confidence 0-1
+            account_type: "GFT" or "THE5ERS"
+            current_dd_pct: Current drawdown percentage
+            symbol: Trading symbol
+
+        Returns:
+            Tuple of (position_dict, rejection_reason or None)
+        """
+        is_gft = account_type.upper() == "GFT"
+
+        # GFT-specific limits
+        if is_gft:
+            max_risk_pct = 2.0          # GFT limit
+            guardian_floating_pct = 1.8  # Guardian for -2% floating loss
+            guardian_total_dd = 5.0      # Guardian for 6% total DD
+            guardian_daily_dd = 2.5      # Guardian for 3% daily DD
+        else:
+            # The5ers limits
+            max_risk_pct = 2.5           # More flexible
+            guardian_floating_pct = 4.0  # No per-trade floating limit
+            guardian_total_dd = 8.0      # Guardian for 10% static DD
+            guardian_daily_dd = 4.0      # Guardian for 5% daily loss
+
+        # Check total DD guardian
+        if current_dd_pct >= guardian_total_dd:
+            return {
+                "size": 0, "risk_amount": 0, "risk_pct": 0,
+                "reason": "total_dd_guardian"
+            }, f"Total DD {current_dd_pct:.1f}% >= guardian {guardian_total_dd}%"
+
+        # GFT CRITICAL: Check if stop distance would breach -2% floating loss
+        if is_gft and stop_distance_pct > guardian_floating_pct:
+            return {
+                "size": 0, "risk_amount": 0, "risk_pct": 0,
+                "reason": "stop_too_wide_for_gft"
+            }, f"Stop {stop_distance_pct:.1f}% would breach GFT -2% floating limit"
+
+        # Calculate base risk
+        dd_room = guardian_total_dd - current_dd_pct
+
+        if dd_room < 1.0:
+            risk_pct = self.min_risk_pct
+        elif dd_room < 2.0:
+            risk_pct = self.base_risk_pct * 0.5
+        elif dd_room < 3.0:
+            risk_pct = self.base_risk_pct * 0.75
+        else:
+            risk_pct = self.base_risk_pct
+
+        # Apply signal confidence
+        risk_pct *= signal_confidence
+
+        # Apply symbol multiplier
+        size_mult = get_size_multiplier(symbol)
+        risk_pct *= size_mult
+
+        # Cap at limits
+        risk_pct = min(risk_pct, max_risk_pct)
+        risk_pct = max(risk_pct, self.min_risk_pct)
+
+        # For GFT: Ensure position won't breach -2% floating loss
+        if is_gft:
+            # Max position size where full stop = 1.8% equity loss
+            max_risk_for_floating = guardian_floating_pct
+            if risk_pct > max_risk_for_floating:
+                logger.warning(
+                    f"Reducing risk from {risk_pct:.2f}% to {max_risk_for_floating}% "
+                    f"for GFT floating loss compliance"
+                )
+                risk_pct = max_risk_for_floating
+
+        # Calculate dollar risk and position size
+        risk_amount = account_equity * (risk_pct / 100)
+
+        if stop_distance_pct > 0:
+            position_size = risk_amount / (stop_distance_pct / 100)
+        else:
+            position_size = 0
+
+        return {
+            "size": position_size,
+            "risk_amount": risk_amount,
+            "risk_pct": risk_pct,
+            "reason": "approved",
+            "compliance": {
+                "account_type": account_type,
+                "max_risk_pct": max_risk_pct,
+                "guardian_floating_pct": guardian_floating_pct,
+                "dd_room": dd_room,
+            }
+        }, None
