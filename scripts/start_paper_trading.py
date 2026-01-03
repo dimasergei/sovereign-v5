@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+Sovereign V5 Paper Trading Runner.
+
+Runs paper trading simulation across 4 prop firm accounts:
+- GFT_1, GFT_2, GFT_3: $10,000 each (GFT Instant GOAT rules)
+- THE5ERS_1: $5,000 (The5ers High Stakes rules)
+
+Elite Portfolio: XAUUSD, XAGUSD, NAS100, UK100, SPX500, EURUSD
+
+Usage:
+    python scripts/start_paper_trading.py
+
+Press Ctrl+C to stop and get final report.
+"""
+
+import json
+import logging
+import os
+import signal
+import sys
+import time
+from dataclasses import asdict
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.paper_executor import PaperExecutor, AccountState
+from data.paper_fetcher import PaperDataFetcher
+from signals.generator import SignalGenerator, TradingSignal
+from core.news_calendar import get_news_calendar
+from core.position_sizer import PositionSizer
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# Account configurations
+ACCOUNTS = [
+    {
+        "name": "GFT_1",
+        "initial_balance": 10000.0,
+        "account_type": "GFT",
+    },
+    {
+        "name": "GFT_2",
+        "initial_balance": 10000.0,
+        "account_type": "GFT",
+    },
+    {
+        "name": "GFT_3",
+        "initial_balance": 10000.0,
+        "account_type": "GFT",
+    },
+    {
+        "name": "THE5ERS_1",
+        "initial_balance": 5000.0,
+        "account_type": "THE5ERS",
+    },
+]
+
+# Elite Portfolio - Top 6 by Sharpe ratio
+SYMBOLS = ["XAUUSD", "XAGUSD", "NAS100", "UK100", "SPX500", "EURUSD"]
+
+# Trading parameters
+TIMEFRAME = "M15"
+BARS_TO_FETCH = 100
+SCAN_INTERVAL_SECONDS = 30  # Scan every 30 seconds
+STATUS_LOG_INTERVAL_SECONDS = 300  # Log status every 5 minutes
+DAILY_REPORT_HOUR = 17  # 5 PM for daily report
+
+# Paths
+LOGS_DIR = "logs"
+STATE_DIR = "storage/state"
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+def setup_logging():
+    """Configure logging for paper trading."""
+    os.makedirs(LOGS_DIR, exist_ok=True)
+
+    log_file = os.path.join(LOGS_DIR, f"paper_trading_{datetime.now().strftime('%Y%m%d')}.log")
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
+    # Reduce noise from external libraries
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('requests').setLevel(logging.WARNING)
+
+    return logging.getLogger('PaperTrading')
+
+
+# ============================================================================
+# PAPER TRADING ENGINE
+# ============================================================================
+
+class PaperTradingRunner:
+    """
+    Runs paper trading across multiple accounts.
+    """
+
+    def __init__(self):
+        """Initialize paper trading runner."""
+        self.logger = setup_logging()
+        self.logger.info("=" * 60)
+        self.logger.info("  SOVEREIGN V5 - PAPER TRADING MODE")
+        self.logger.info("=" * 60)
+
+        # Initialize components
+        self.data_fetcher = PaperDataFetcher()
+        self.signal_generator = SignalGenerator(min_confidence=0.40)
+        self.position_sizer = PositionSizer()
+        self.news_calendar = get_news_calendar()
+
+        # Initialize accounts
+        self.executors: Dict[str, PaperExecutor] = {}
+        self._init_accounts()
+
+        # State tracking
+        self.running = True
+        self.start_time = datetime.now()
+        self.last_status_log = datetime.now()
+        self.last_daily_report = datetime.now().date()
+        self.total_signals = 0
+        self.total_trades = 0
+
+        # Price cache
+        self.current_prices: Dict[str, Dict[str, float]] = {}
+
+        # Signal handlers
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _init_accounts(self):
+        """Initialize paper trading accounts."""
+        os.makedirs(STATE_DIR, exist_ok=True)
+
+        for config in ACCOUNTS:
+            executor = PaperExecutor(
+                initial_balance=config["initial_balance"],
+                account_type=config["account_type"],
+                account_name=config["name"],
+                state_file=os.path.join(STATE_DIR, f"{config['name']}_paper.json"),
+                config={"MAX_POSITIONS": 3}
+            )
+            self.executors[config["name"]] = executor
+            self.logger.info(
+                f"  Account {config['name']}: ${config['initial_balance']:,.0f} "
+                f"({config['account_type']})"
+            )
+
+        self.logger.info(f"  Symbols: {', '.join(SYMBOLS)}")
+        self.logger.info("=" * 60)
+
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        self.logger.info("\n[SHUTDOWN] Received signal, stopping gracefully...")
+        self.running = False
+
+    def run(self):
+        """Main paper trading loop."""
+        self.logger.info("[START] Paper trading started")
+        self.logger.info(f"[CONFIG] Scan interval: {SCAN_INTERVAL_SECONDS}s")
+        self.logger.info(f"[CONFIG] Status log interval: {STATUS_LOG_INTERVAL_SECONDS}s")
+
+        # Refresh news calendar
+        self.news_calendar.refresh()
+
+        scan_count = 0
+
+        try:
+            while self.running:
+                scan_count += 1
+
+                try:
+                    # Fetch latest prices
+                    self._fetch_prices()
+
+                    # Update existing positions
+                    self._update_positions()
+
+                    # Check for new signals and execute trades
+                    self._scan_for_signals()
+
+                    # Log status periodically
+                    self._maybe_log_status()
+
+                    # Save daily report
+                    self._maybe_save_daily_report()
+
+                except Exception as e:
+                    self.logger.error(f"[ERROR] Scan error: {e}", exc_info=True)
+
+                # Wait for next scan
+                if self.running:
+                    time.sleep(SCAN_INTERVAL_SECONDS)
+
+        except KeyboardInterrupt:
+            self.logger.info("[SHUTDOWN] Keyboard interrupt received")
+        finally:
+            self._generate_final_report()
+
+    def _fetch_prices(self):
+        """Fetch current prices for all symbols."""
+        for symbol in SYMBOLS:
+            try:
+                # Get historical bars for signal generation
+                df = self.data_fetcher.get_historical_bars(
+                    symbol, TIMEFRAME, BARS_TO_FETCH
+                )
+
+                if not df.empty:
+                    # Cache for signal generation
+                    self.signal_generator.update_related_data(symbol, df)
+
+                    # Get current price
+                    last_bar = df.iloc[-1]
+                    self.current_prices[symbol] = {
+                        'bid': last_bar['close'] - (last_bar['close'] * 0.0001),
+                        'ask': last_bar['close'] + (last_bar['close'] * 0.0001),
+                        'price': last_bar['close'],
+                        'close': last_bar['close'],
+                        'high': last_bar['high'],
+                        'low': last_bar['low'],
+                    }
+
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch {symbol}: {e}")
+
+    def _update_positions(self):
+        """Update all open positions with current prices."""
+        for name, executor in self.executors.items():
+            if executor.open_positions:
+                # Map prices to symbol variants (with .x suffix for GFT)
+                prices = {}
+                for symbol, price_data in self.current_prices.items():
+                    prices[symbol] = price_data
+                    prices[f"{symbol}.x"] = price_data
+
+                closed = executor.update_positions(prices)
+
+                for pos in closed:
+                    self.logger.info(
+                        f"[{name}] Position closed: {pos.symbol} "
+                        f"{pos.status.value} P&L=${pos.realized_pnl:+.2f}"
+                    )
+
+    def _scan_for_signals(self):
+        """Scan for trading signals across all symbols."""
+        for symbol in SYMBOLS:
+            try:
+                # Get data for signal generation
+                df = self.data_fetcher.get_historical_bars(
+                    symbol, TIMEFRAME, BARS_TO_FETCH
+                )
+
+                if df.empty or len(df) < 50:
+                    continue
+
+                # Generate signal
+                signal = self.signal_generator.generate_signal(df, symbol)
+                self.total_signals += 1
+
+                # Check if actionable
+                if signal.action == "neutral":
+                    continue
+
+                self.logger.info(
+                    f"[SIGNAL] {symbol}: {signal.action.upper()} "
+                    f"conf={signal.confidence:.2f} "
+                    f"reason={signal.entry_reason}"
+                )
+
+                # Try to execute on each account
+                self._execute_signal(signal)
+
+            except Exception as e:
+                self.logger.warning(f"Signal scan error for {symbol}: {e}")
+
+    def _execute_signal(self, signal: TradingSignal):
+        """Execute signal on all eligible accounts."""
+        for name, executor in self.executors.items():
+            try:
+                # Check news blackout
+                if self.news_calendar.is_blackout_period(executor.account_type):
+                    blackout_info = self.news_calendar.get_blackout_info(executor.account_type)
+                    self.logger.warning(
+                        f"[{name}] News blackout: {blackout_info.get('event', 'unknown')}"
+                    )
+                    continue
+
+                # Get current account state
+                state = executor.get_account_state()
+
+                # Check if we can take more positions
+                if state.open_positions >= 3:
+                    continue
+
+                # Check if we already have a position in this symbol
+                symbol_with_suffix = f"{signal.symbol}.x" if executor.account_type == "GFT" else signal.symbol
+                existing = [
+                    p for p in executor.get_open_positions()
+                    if signal.symbol in p.symbol
+                ]
+                if existing:
+                    continue
+
+                # Calculate position size with compliance
+                current_price = signal.current_price
+                if current_price <= 0:
+                    price_data = self.current_prices.get(signal.symbol, {})
+                    current_price = price_data.get('close', 0)
+
+                if current_price <= 0:
+                    continue
+
+                # Calculate stop distance
+                stop_distance = abs(current_price - signal.stop_loss) if signal.stop_loss else current_price * 0.01
+                stop_distance_pct = (stop_distance / current_price) * 100
+
+                # Get compliant position size
+                size_result, rejection = self.position_sizer.calculate_with_compliance(
+                    account_balance=state.balance,
+                    account_equity=state.equity,
+                    stop_distance_pct=stop_distance_pct,
+                    signal_confidence=signal.confidence,
+                    account_type=executor.account_type,
+                    current_dd_pct=state.current_dd_pct,
+                    symbol=signal.symbol
+                )
+
+                if rejection:
+                    self.logger.warning(f"[{name}] Position rejected: {rejection}")
+                    continue
+
+                if size_result.get('size', 0) <= 0:
+                    continue
+
+                # Normalize position size (round to reasonable lot size)
+                position_size = self._normalize_size(signal.symbol, size_result['size'], current_price)
+
+                if position_size <= 0:
+                    continue
+
+                # Calculate stop loss and take profit
+                if signal.stop_loss and signal.take_profit:
+                    stop_loss = signal.stop_loss
+                    take_profit = signal.take_profit
+                else:
+                    # Default: 1.5 ATR stop, 3 ATR target
+                    atr = signal.atr if signal.atr > 0 else current_price * 0.01
+                    if signal.action == "long":
+                        stop_loss = current_price - (atr * 1.5)
+                        take_profit = current_price + (atr * 3.0)
+                    else:
+                        stop_loss = current_price + (atr * 1.5)
+                        take_profit = current_price - (atr * 3.0)
+
+                # Execute trade
+                success, msg, position = executor.open_position(
+                    symbol=symbol_with_suffix,
+                    direction=signal.action,
+                    size=position_size,
+                    entry_price=current_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    signal_info={
+                        "confidence": signal.confidence,
+                        "strategies": signal.strategies_agreeing,
+                        "primary": signal.primary_strategy,
+                    },
+                    comment=signal.entry_reason
+                )
+
+                if success:
+                    self.total_trades += 1
+                    self.logger.info(
+                        f"[{name}] TRADE OPENED: {signal.action.upper()} {symbol_with_suffix} "
+                        f"size={position_size:.4f} @ {current_price:.2f} "
+                        f"SL={stop_loss:.2f} TP={take_profit:.2f}"
+                    )
+                else:
+                    self.logger.warning(f"[{name}] Trade blocked: {msg}")
+
+            except Exception as e:
+                self.logger.error(f"[{name}] Execution error: {e}", exc_info=True)
+
+    def _normalize_size(self, symbol: str, raw_size: float, price: float) -> float:
+        """Normalize position size based on symbol type."""
+        symbol_upper = symbol.upper()
+
+        # Forex pairs (100,000 unit lots)
+        if 'EUR' in symbol_upper or 'GBP' in symbol_upper or 'JPY' in symbol_upper:
+            # Convert to lots (min 0.01)
+            lots = raw_size / 100000
+            return max(0.01, round(lots, 2)) * 100000
+
+        # Gold (100 oz per lot)
+        elif 'XAU' in symbol_upper:
+            lots = raw_size / (price * 100)
+            return max(0.01, round(lots, 2)) * 100
+
+        # Silver (5000 oz per lot)
+        elif 'XAG' in symbol_upper:
+            lots = raw_size / (price * 5000)
+            return max(0.01, round(lots, 2)) * 5000
+
+        # Indices
+        elif 'NAS' in symbol_upper or 'SPX' in symbol_upper or 'UK' in symbol_upper:
+            # 1 contract per point
+            lots = raw_size / price
+            return max(0.1, round(lots, 1))
+
+        # Default: round to 2 decimals
+        return max(0.01, round(raw_size, 2))
+
+    def _maybe_log_status(self):
+        """Log status if interval has passed."""
+        now = datetime.now()
+        elapsed = (now - self.last_status_log).total_seconds()
+
+        if elapsed >= STATUS_LOG_INTERVAL_SECONDS:
+            self._log_status()
+            self.last_status_log = now
+
+    def _log_status(self):
+        """Log current account status."""
+        self.logger.info("-" * 60)
+        self.logger.info("  ACCOUNT STATUS")
+        self.logger.info("-" * 60)
+
+        total_equity = 0
+        total_pnl = 0
+
+        for name, executor in self.executors.items():
+            state = executor.get_account_state()
+            total_equity += state.equity
+            total_pnl += state.realized_pnl + state.unrealized_pnl
+
+            self.logger.info(
+                f"  {name:12} | Equity: ${state.equity:>10,.2f} | "
+                f"P&L: ${state.realized_pnl + state.unrealized_pnl:>+8,.2f} | "
+                f"DD: {state.current_dd_pct:>5.2f}% | "
+                f"Pos: {state.open_positions}"
+            )
+
+        self.logger.info("-" * 60)
+        self.logger.info(
+            f"  TOTAL        | Equity: ${total_equity:>10,.2f} | "
+            f"P&L: ${total_pnl:>+8,.2f}"
+        )
+        self.logger.info(
+            f"  Signals: {self.total_signals} | Trades: {self.total_trades} | "
+            f"Runtime: {datetime.now() - self.start_time}"
+        )
+        self.logger.info("-" * 60)
+
+    def _maybe_save_daily_report(self):
+        """Save daily report at configured hour."""
+        now = datetime.now()
+
+        # Check if we've passed the report hour and haven't saved today
+        if now.hour >= DAILY_REPORT_HOUR and now.date() > self.last_daily_report:
+            self._save_daily_report()
+            self.last_daily_report = now.date()
+
+    def _save_daily_report(self):
+        """Save daily trading report."""
+        os.makedirs(LOGS_DIR, exist_ok=True)
+
+        report = {
+            "date": datetime.now().isoformat(),
+            "runtime_hours": (datetime.now() - self.start_time).total_seconds() / 3600,
+            "total_signals": self.total_signals,
+            "total_trades": self.total_trades,
+            "accounts": {}
+        }
+
+        for name, executor in self.executors.items():
+            state = executor.get_account_state()
+            report["accounts"][name] = {
+                "account_type": executor.account_type,
+                "initial_balance": state.initial_balance,
+                "balance": state.balance,
+                "equity": state.equity,
+                "realized_pnl": state.realized_pnl,
+                "unrealized_pnl": state.unrealized_pnl,
+                "total_pnl": state.realized_pnl + state.unrealized_pnl,
+                "pnl_pct": ((state.equity - state.initial_balance) / state.initial_balance) * 100,
+                "current_dd_pct": state.current_dd_pct,
+                "max_dd_pct": state.max_dd_pct,
+                "total_trades": state.total_trades,
+                "win_rate": state.win_rate,
+                "profit_factor": state.profit_factor,
+                "open_positions": state.open_positions,
+            }
+
+        # Calculate totals
+        total_initial = sum(r["initial_balance"] for r in report["accounts"].values())
+        total_equity = sum(r["equity"] for r in report["accounts"].values())
+        total_pnl = sum(r["total_pnl"] for r in report["accounts"].values())
+
+        report["summary"] = {
+            "total_initial_balance": total_initial,
+            "total_equity": total_equity,
+            "total_pnl": total_pnl,
+            "total_pnl_pct": (total_pnl / total_initial) * 100 if total_initial > 0 else 0,
+        }
+
+        # Save report
+        report_file = os.path.join(
+            LOGS_DIR,
+            f"daily_report_{datetime.now().strftime('%Y%m%d')}.json"
+        )
+
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+
+        self.logger.info(f"[REPORT] Daily report saved: {report_file}")
+
+    def _generate_final_report(self):
+        """Generate and display final report."""
+        self.logger.info("\n")
+        self.logger.info("=" * 60)
+        self.logger.info("  FINAL PAPER TRADING REPORT")
+        self.logger.info("=" * 60)
+
+        runtime = datetime.now() - self.start_time
+        self.logger.info(f"  Start Time:     {self.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"  End Time:       {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.logger.info(f"  Runtime:        {runtime}")
+        self.logger.info(f"  Total Signals:  {self.total_signals}")
+        self.logger.info(f"  Total Trades:   {self.total_trades}")
+        self.logger.info("=" * 60)
+
+        total_initial = 0
+        total_equity = 0
+        total_realized = 0
+        total_unrealized = 0
+
+        for name, executor in self.executors.items():
+            state = executor.get_account_state()
+
+            total_initial += state.initial_balance
+            total_equity += state.equity
+            total_realized += state.realized_pnl
+            total_unrealized += state.unrealized_pnl
+
+            pnl = state.realized_pnl + state.unrealized_pnl
+            pnl_pct = (pnl / state.initial_balance) * 100
+
+            self.logger.info(f"\n  [{name}] ({executor.account_type})")
+            self.logger.info(f"  {'─' * 40}")
+            self.logger.info(f"  Initial Balance:  ${state.initial_balance:>10,.2f}")
+            self.logger.info(f"  Current Balance:  ${state.balance:>10,.2f}")
+            self.logger.info(f"  Current Equity:   ${state.equity:>10,.2f}")
+            self.logger.info(f"  Realized P&L:     ${state.realized_pnl:>+10,.2f}")
+            self.logger.info(f"  Unrealized P&L:   ${state.unrealized_pnl:>+10,.2f}")
+            self.logger.info(f"  Total P&L:        ${pnl:>+10,.2f} ({pnl_pct:+.2f}%)")
+            self.logger.info(f"  Max Drawdown:     {state.max_dd_pct:>10.2f}%")
+            self.logger.info(f"  Total Trades:     {state.total_trades:>10}")
+            self.logger.info(f"  Win Rate:         {state.win_rate:>10.1f}%")
+            self.logger.info(f"  Profit Factor:    {state.profit_factor:>10.2f}")
+            self.logger.info(f"  Open Positions:   {state.open_positions:>10}")
+
+            # Print trade history (last 5)
+            history = executor.get_trade_history()
+            if history:
+                self.logger.info(f"\n  Recent Trades (last 5):")
+                for trade in history[-5:]:
+                    self.logger.info(
+                        f"    {trade.symbol} {trade.direction.upper()} "
+                        f"${trade.realized_pnl:+.2f} ({trade.status})"
+                    )
+
+        # Summary
+        total_pnl = total_realized + total_unrealized
+        total_pnl_pct = (total_pnl / total_initial) * 100 if total_initial > 0 else 0
+
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("  COMBINED SUMMARY")
+        self.logger.info("=" * 60)
+        self.logger.info(f"  Total Initial:    ${total_initial:>10,.2f}")
+        self.logger.info(f"  Total Equity:     ${total_equity:>10,.2f}")
+        self.logger.info(f"  Total P&L:        ${total_pnl:>+10,.2f} ({total_pnl_pct:+.2f}%)")
+        self.logger.info(f"  Realized P&L:     ${total_realized:>+10,.2f}")
+        self.logger.info(f"  Unrealized P&L:   ${total_unrealized:>+10,.2f}")
+        self.logger.info("=" * 60)
+
+        # Save final report
+        self._save_daily_report()
+
+        self.logger.info("\n[END] Paper trading session complete")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    print("\n" + "=" * 60)
+    print("  SOVEREIGN V5 - PAPER TRADING")
+    print("  Press Ctrl+C to stop")
+    print("=" * 60 + "\n")
+
+    runner = PaperTradingRunner()
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()

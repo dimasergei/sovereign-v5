@@ -61,9 +61,11 @@ venv.bak/
 *.swp
 *.swo
 
-# Storage (don't commit state/logs)
-storage/state/*.json
-storage/logs/*.log
+# Storage and logs (don't commit runtime data)
+logs/
+storage/state/
+storage/cache/
+storage/logs/
 storage/models/*.pkl
 storage/models/*.h5
 
