@@ -84,6 +84,12 @@ STATUS_LOG_INTERVAL_SECONDS = 300  # Log status every 5 minutes
 TELEGRAM_STATUS_INTERVAL_SECONDS = 1800  # Telegram status every 30 minutes
 DAILY_REPORT_HOUR = 17  # 5 PM for daily report
 
+# Risk Management - ADJUSTED FOR STABILITY
+STOP_LOSS_ATR_MULT = 2.5      # Wider stops to avoid whipsaws (was 1.5)
+TAKE_PROFIT_ATR_MULT = 5.0    # 2:1 reward-to-risk ratio
+MIN_SIGNAL_CONFIDENCE = 0.60  # Higher confidence threshold (was 0.40)
+SIGNAL_COOLDOWN_SECONDS = 300 # 5 min cooldown per symbol after signal
+
 # Paths
 LOGS_DIR = "logs"
 STATE_DIR = "storage/state"
@@ -453,7 +459,7 @@ class PaperTradingRunner:
 
         # Initialize components
         self.data_fetcher = PaperDataFetcher()
-        self.signal_generator = SignalGenerator(min_confidence=0.40)
+        self.signal_generator = SignalGenerator(min_confidence=MIN_SIGNAL_CONFIDENCE)
         self.position_sizer = PositionSizer()
         self.news_calendar = get_news_calendar()
         self.telegram = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS)
@@ -475,6 +481,9 @@ class PaperTradingRunner:
 
         # Price cache
         self.current_prices: Dict[str, Dict[str, float]] = {}
+
+        # Signal cooldown tracking (prevents flip-flopping)
+        self.last_signal_time: Dict[str, datetime] = {}  # symbol -> last signal time
 
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -628,6 +637,20 @@ class PaperTradingRunner:
                     self.neutral_signals += 1
                     continue
 
+                # Check signal cooldown (prevent flip-flopping)
+                now = datetime.now()
+                last_signal = self.last_signal_time.get(symbol)
+                if last_signal:
+                    cooldown_remaining = (now - last_signal).total_seconds()
+                    if cooldown_remaining < SIGNAL_COOLDOWN_SECONDS:
+                        self.logger.debug(
+                            f"[COOLDOWN] {symbol}: {SIGNAL_COOLDOWN_SECONDS - cooldown_remaining:.0f}s remaining"
+                        )
+                        continue
+
+                # Update cooldown timer
+                self.last_signal_time[symbol] = now
+
                 # Count actionable signals
                 self.total_signals += 1
 
@@ -708,19 +731,14 @@ class PaperTradingRunner:
                 if position_size <= 0:
                     continue
 
-                # Calculate stop loss and take profit
-                if sig.stop_loss and sig.take_profit:
-                    stop_loss = sig.stop_loss
-                    take_profit = sig.take_profit
+                # Calculate stop loss and take profit using wider stops
+                atr = sig.atr if sig.atr > 0 else current_price * 0.01
+                if sig.action == "long":
+                    stop_loss = current_price - (atr * STOP_LOSS_ATR_MULT)
+                    take_profit = current_price + (atr * TAKE_PROFIT_ATR_MULT)
                 else:
-                    # Default: 1.5 ATR stop, 3 ATR target
-                    atr = sig.atr if sig.atr > 0 else current_price * 0.01
-                    if sig.action == "long":
-                        stop_loss = current_price - (atr * 1.5)
-                        take_profit = current_price + (atr * 3.0)
-                    else:
-                        stop_loss = current_price + (atr * 1.5)
-                        take_profit = current_price - (atr * 3.0)
+                    stop_loss = current_price + (atr * STOP_LOSS_ATR_MULT)
+                    take_profit = current_price - (atr * TAKE_PROFIT_ATR_MULT)
 
                 # Execute trade
                 success, msg, position = executor.open_position(
