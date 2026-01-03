@@ -194,7 +194,8 @@ class TelegramNotifier:
         self.send(msg)
 
     def send_trade_opened(self, account: str, symbol: str, direction: str,
-                          size: float, price: float, sl: float, tp: float):
+                          size: float, price: float, sl: float, tp: float,
+                          risk_amount: float = 0, risk_pct: float = 0):
         """Send trade opened notification."""
         emoji = "📈" if direction.upper() in ("LONG", "BUY") else "📉"
         msg = (
@@ -202,7 +203,7 @@ class TelegramNotifier:
             f"📊 <b>Account:</b> {account}\n"
             f"💱 <b>Symbol:</b> {symbol}\n"
             f"↗️ <b>Direction:</b> {direction.upper()}\n"
-            f"📏 <b>Size:</b> {size:.4f}\n"
+            f"📏 <b>Risk:</b> ${risk_amount:.2f} ({risk_pct:.2f}%)\n"
             f"💵 <b>Entry:</b> {price:.2f}\n"
             f"🛑 <b>SL:</b> {sl:.2f}\n"
             f"🎯 <b>TP:</b> {tp:.2f}"
@@ -812,7 +813,9 @@ class PaperTradingRunner:
                     # Send Telegram notification
                     self.telegram.send_trade_opened(
                         name, symbol_with_suffix, sig.action,
-                        position_size, current_price, stop_loss, take_profit
+                        position_size, current_price, stop_loss, take_profit,
+                        risk_amount=size_result.get('risk_amount', 0),
+                        risk_pct=size_result.get('risk_pct', 0)
                     )
                 else:
                     self.logger.warning(f"[{name}] Trade blocked: {msg}")

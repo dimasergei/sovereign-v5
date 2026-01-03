@@ -7,7 +7,7 @@ RULES (DO NOT MODIFY):
 - Max daily loss: 5% (guardian: 4%)
 - Max overall loss: 10% (guardian: 8.5%)
 - Consistency rule: No single day > 30% of total profit
-- Forex majors/minors only
+- CFDs (Gold, Silver, Indices, Forex)
 
 Usage:
     python the5ers_bot.py --config config/the5ers_account.py
@@ -49,7 +49,7 @@ DEFAULT_CONFIG = {
     'MT5_PATH': r'C:\Program Files\MetaTrader 5\terminal64.exe',
     'TELEGRAM_TOKEN': '',
     'TELEGRAM_CHAT_IDS': [],
-    'SYMBOLS': ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'EURGBP', 'EURJPY'],
+    'SYMBOLS': ['XAUUSD', 'XAGUSD', 'NAS100', 'UK100', 'SPX500', 'EURUSD'],
     'TIMEFRAME': 'M5',
     'SCAN_INTERVAL': 60,
     'MAX_DRAWDOWN_PERCENT': 8.5,

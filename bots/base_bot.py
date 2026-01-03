@@ -472,7 +472,9 @@ class BaseTradingBot(ABC):
                         action="OPEN",
                         direction=signal.action.upper(),
                         price=result.avg_fill_price,
-                        size=lots
+                        size=lots,
+                        risk_amount=sizing_details.get('risk_amount'),
+                        risk_pct=sizing_details.get('dd_scaled_risk_pct')
                     )
             else:
                 logger.error(f"Execution failed: {result.error}")

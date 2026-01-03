@@ -183,20 +183,28 @@ class TelegramCommandCenter:
         price: float,
         size: float,
         pnl: float = None,
-        chat_id: int = None
+        chat_id: int = None,
+        risk_amount: float = None,
+        risk_pct: float = None
     ):
         """Send trade notification."""
         pnl_str = f"\nP&L: ${pnl:+.2f}" if pnl is not None else ""
-        
+
+        # Show risk amount and percentage if provided, otherwise fall back to lots
+        if risk_amount is not None and risk_pct is not None:
+            size_str = f"Risk: ${risk_amount:.2f} ({risk_pct:.2f}%)"
+        else:
+            size_str = f"Size: {size:.2f} lots"
+
         message = (
             f"🔔 *{action}*\n"
             f"Symbol: `{symbol}`\n"
             f"Direction: {direction}\n"
             f"Price: {price:.5f}\n"
-            f"Size: {size:.2f} lots"
+            f"{size_str}"
             f"{pnl_str}"
         )
-        
+
         await self.send_alert(message, AlertLevel.TRADE, chat_id)
     
     def _is_authorized(self, chat_id: int) -> bool:
@@ -502,18 +510,26 @@ class TelegramNotifier:
         direction: str,
         price: float,
         size: float,
-        pnl: float = None
+        pnl: float = None,
+        risk_amount: float = None,
+        risk_pct: float = None
     ):
         """Send trade notification synchronously."""
         pnl_str = f"\nP&L: ${pnl:+.2f}" if pnl is not None else ""
-        
+
+        # Show risk amount and percentage if provided, otherwise fall back to lots
+        if risk_amount is not None and risk_pct is not None:
+            size_str = f"Risk: ${risk_amount:.2f} ({risk_pct:.2f}%)"
+        else:
+            size_str = f"Size: {size:.2f} lots"
+
         message = (
             f"🔔 *{action}*\n"
             f"Symbol: `{symbol}`\n"
             f"Direction: {direction}\n"
             f"Price: {price:.5f}\n"
-            f"Size: {size:.2f} lots"
+            f"{size_str}"
             f"{pnl_str}"
         )
-        
+
         self.send_alert(message, AlertLevel.TRADE)
