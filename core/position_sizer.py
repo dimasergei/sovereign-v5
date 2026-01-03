@@ -20,13 +20,14 @@ logger = logging.getLogger(__name__)
 
 
 # Symbol-specific size multipliers based on Sharpe ratio performance
-# More conservative to avoid guardian triggers
+# Elite Portfolio - Top 6 by Sharpe ratio
 SYMBOL_SIZE_MULTIPLIER = {
-    'XAUUSD': 1.2,   # Sharpe 2.70 - increase size 20%
-    'NAS100': 1.15,  # Sharpe 1.54 - increase size 15%
-    'SPX500': 1.1,   # Sharpe 1.09 - increase size 10%
-    'EURUSD': 1.0,   # Sharpe 0.90 - keep normal
-    'BTCUSD': 0.7,   # Sharpe 0.19 - REDUCE size 30% (if used)
+    'XAUUSD': 1.2,   # Sharpe 2.70 - Gold, best performer
+    'XAGUSD': 1.2,   # Sharpe 2.30 - Silver, excellent addition
+    'NAS100': 1.15,  # Sharpe 1.54 - Tech index
+    'UK100': 1.1,    # Sharpe 1.24 - FTSE 100
+    'SPX500': 1.1,   # Sharpe 1.09 - S&P 500
+    'EURUSD': 1.0,   # Sharpe 0.90 - Major forex pair
 }
 
 

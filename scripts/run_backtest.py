@@ -59,16 +59,37 @@ SYMBOL_MAP = {
     'ETHUSD.x': 'ETH-USD',
     'SOLUSD': 'SOL-USD',
     'SOLUSD.x': 'SOL-USD',
-    # Gold
-    'XAUUSD': 'GC=F',
+    # Commodities
+    'XAUUSD': 'GC=F',      # Gold futures
     'XAUUSD.x': 'GC=F',
-    # Forex
+    'XAGUSD': 'SI=F',      # Silver futures
+    'XAGUSD.x': 'SI=F',
+    'USOIL': 'CL=F',       # WTI Crude Oil futures
+    'USOIL.x': 'CL=F',
+    # Forex Majors
     'EURUSD': 'EURUSD=X',
     'EURUSD.x': 'EURUSD=X',
     'GBPUSD': 'GBPUSD=X',
     'GBPUSD.x': 'GBPUSD=X',
-    'USDJPY': 'USDJPY=X',
-    'USDJPY.x': 'USDJPY=X',
+    'USDJPY': 'JPY=X',     # Note: Yahoo uses inverse
+    'USDJPY.x': 'JPY=X',
+    'USDCHF': 'CHF=X',
+    'USDCHF.x': 'CHF=X',
+    'AUDUSD': 'AUDUSD=X',
+    'AUDUSD.x': 'AUDUSD=X',
+    'USDCAD': 'CAD=X',
+    'USDCAD.x': 'CAD=X',
+    'NZDUSD': 'NZDUSD=X',
+    'NZDUSD.x': 'NZDUSD=X',
+    # Forex Crosses
+    'EURGBP': 'EURGBP=X',
+    'EURGBP.x': 'EURGBP=X',
+    'EURJPY': 'EURJPY=X',
+    'EURJPY.x': 'EURJPY=X',
+    'GBPJPY': 'GBPJPY=X',
+    'GBPJPY.x': 'GBPJPY=X',
+    'AUDJPY': 'AUDJPY=X',
+    'AUDJPY.x': 'AUDJPY=X',
     # Indices
     'NAS100': '^IXIC',
     'NAS100.x': '^IXIC',
@@ -76,6 +97,10 @@ SYMBOL_MAP = {
     'US30.x': '^DJI',
     'SPX500': '^GSPC',
     'SPX500.x': '^GSPC',
+    'GER40': '^GDAXI',     # DAX
+    'GER40.x': '^GDAXI',
+    'UK100': '^FTSE',      # FTSE 100
+    'UK100.x': '^FTSE',
 }
 
 logger = logging.getLogger(__name__)
@@ -272,8 +297,9 @@ def run_backtest(symbol: str, days: int = 365, verbose: bool = False) -> Backtes
 
 
 def run_all_symbols(days: int = 365, verbose: bool = False) -> Dict[str, BacktestResult]:
-    """Run backtest on all major symbols."""
-    symbols = ['BTCUSD', 'XAUUSD', 'NAS100', 'EURUSD']
+    """Run backtest on elite portfolio symbols (top 6 by Sharpe ratio)."""
+    # Elite Portfolio - optimized for maximum Sharpe-weighted returns
+    symbols = ['XAUUSD', 'XAGUSD', 'NAS100', 'UK100', 'SPX500', 'EURUSD']
     results = {}
 
     for symbol in symbols:
