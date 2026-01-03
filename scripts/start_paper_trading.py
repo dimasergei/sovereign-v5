@@ -40,6 +40,14 @@ from signals.generator import SignalGenerator, TradingSignal
 from core.news_calendar import get_news_calendar
 from core.position_sizer import PositionSizer
 
+# MT5 imports (optional - for real data)
+try:
+    from core.mt5_connector import MT5Connector, MT5Credentials
+    from data.mt5_fetcher import MT5DataFetcher
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+
 
 # ============================================================================
 # CONFIGURATION
@@ -48,6 +56,13 @@ from core.position_sizer import PositionSizer
 # Telegram Configuration
 TELEGRAM_BOT_TOKEN = "8044940173:AAE6eEz3NjXxWaHkZq3nP903m2LHZAhuYjM"
 TELEGRAM_CHAT_IDS = [7898079111]
+
+# MT5 Configuration - Use real data from MT5 demo account
+USE_MT5_DATA = True  # Set to False to use synthetic data
+MT5_LOGIN = 314329147
+MT5_PASSWORD = "e#sBIdI0sV"
+MT5_SERVER = "GoatFunded-Server"
+MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
 # Account configurations
 ACCOUNTS = [
@@ -73,8 +88,8 @@ ACCOUNTS = [
     },
 ]
 
-# Elite Portfolio - Top 6 by Sharpe ratio
-SYMBOLS = ["XAUUSD", "XAGUSD", "NAS100", "UK100", "SPX500", "EURUSD"]
+# Elite Portfolio - Top 6 by Sharpe ratio (use .x suffix for GFT broker)
+SYMBOLS = ["XAUUSD.x", "XAGUSD.x", "NAS100.x", "UK100.x", "SPX500.x", "EURUSD.x"]
 
 # Trading parameters
 TIMEFRAME = "M15"
@@ -457,8 +472,35 @@ class PaperTradingRunner:
         self.logger.info("  SOVEREIGN V5 - PAPER TRADING MODE")
         self.logger.info("=" * 60)
 
-        # Initialize components
-        self.data_fetcher = PaperDataFetcher()
+        # Initialize MT5 connection if available and enabled
+        self.mt5_connector = None
+        if USE_MT5_DATA and MT5_AVAILABLE:
+            self.logger.info("[MT5] Connecting to MetaTrader 5 for real market data...")
+            try:
+                credentials = MT5Credentials(
+                    login=MT5_LOGIN,
+                    password=MT5_PASSWORD,
+                    server=MT5_SERVER,
+                    path=MT5_PATH
+                )
+                self.mt5_connector = MT5Connector(credentials)
+                if self.mt5_connector.connect():
+                    self.logger.info("[MT5] Connected successfully - using REAL market data")
+                    self.data_fetcher = MT5DataFetcher(self.mt5_connector)
+                else:
+                    self.logger.warning("[MT5] Connection failed - falling back to synthetic data")
+                    self.data_fetcher = PaperDataFetcher()
+            except Exception as e:
+                self.logger.error(f"[MT5] Error: {e} - falling back to synthetic data")
+                self.data_fetcher = PaperDataFetcher()
+        else:
+            if not MT5_AVAILABLE:
+                self.logger.warning("[MT5] MetaTrader5 library not installed - using synthetic data")
+            else:
+                self.logger.info("[CONFIG] USE_MT5_DATA=False - using synthetic data")
+            self.data_fetcher = PaperDataFetcher()
+
+        # Initialize other components
         self.signal_generator = SignalGenerator(min_confidence=MIN_SIGNAL_CONFIDENCE)
         self.position_sizer = PositionSizer()
         self.news_calendar = get_news_calendar()
@@ -686,7 +728,11 @@ class PaperTradingRunner:
                     continue
 
                 # Check if we already have a position in this symbol
-                symbol_with_suffix = f"{sig.symbol}.x" if executor.account_type == "GFT" else sig.symbol
+                # Symbols come with .x suffix (from GFT MT5), strip for The5ers
+                if executor.account_type == "GFT":
+                    symbol_with_suffix = sig.symbol  # Already has .x
+                else:
+                    symbol_with_suffix = sig.symbol.replace('.x', '')  # Strip .x for The5ers
                 existing = [
                     p for p in executor.get_open_positions()
                     if sig.symbol in p.symbol
@@ -1014,6 +1060,11 @@ class PaperTradingRunner:
 
         # Send Telegram shutdown notification
         self.telegram.send_shutdown(summary)
+
+        # Disconnect MT5 if connected
+        if self.mt5_connector:
+            self.logger.info("[MT5] Disconnecting from MetaTrader 5...")
+            self.mt5_connector.disconnect()
 
         self.logger.info("\n[END] Paper trading session complete")
 
