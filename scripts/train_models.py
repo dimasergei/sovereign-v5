@@ -218,6 +218,98 @@ def generate_synthetic_data(
     return data
 
 
+def fetch_mt5_data(
+    symbols: List[str],
+    timeframe: str = 'H1',
+    bars_per_symbol: int = 5000
+) -> Optional[Dict[str, pd.DataFrame]]:
+    """
+    Fetch real OHLCV data from MetaTrader 5.
+
+    Uses GFT MT5 instance which requires .x suffix for symbols.
+
+    Args:
+        symbols: List of base symbols (e.g., ['XAUUSD', 'EURUSD'])
+        timeframe: MT5 timeframe string (H1, M15, D1, etc.)
+        bars_per_symbol: Number of bars to fetch per symbol
+
+    Returns:
+        Dict mapping symbol to DataFrame, or None if MT5 unavailable
+    """
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        logger.warning("MetaTrader5 package not installed")
+        return None
+
+    # Initialize MT5
+    if not mt5.initialize():
+        logger.warning(f"MT5 initialization failed: {mt5.last_error()}")
+        return None
+
+    logger.info("Connected to MT5, fetching real market data...")
+
+    # Map timeframe string to MT5 constant
+    timeframe_map = {
+        'M1': mt5.TIMEFRAME_M1,
+        'M5': mt5.TIMEFRAME_M5,
+        'M15': mt5.TIMEFRAME_M15,
+        'M30': mt5.TIMEFRAME_M30,
+        'H1': mt5.TIMEFRAME_H1,
+        'H4': mt5.TIMEFRAME_H4,
+        'D1': mt5.TIMEFRAME_D1,
+        'W1': mt5.TIMEFRAME_W1,
+        'MN1': mt5.TIMEFRAME_MN1,
+    }
+
+    mt5_timeframe = timeframe_map.get(timeframe, mt5.TIMEFRAME_H1)
+
+    data = {}
+
+    for symbol in symbols:
+        # Add .x suffix for GFT MT5 instance
+        mt5_symbol = f"{symbol}.x"
+
+        # Ensure symbol is selected
+        if not mt5.symbol_select(mt5_symbol, True):
+            logger.warning(f"  {mt5_symbol}: Failed to select symbol, skipping")
+            continue
+
+        # Fetch OHLCV data
+        rates = mt5.copy_rates_from_pos(mt5_symbol, mt5_timeframe, 0, bars_per_symbol)
+
+        if rates is None or len(rates) == 0:
+            logger.warning(f"  {mt5_symbol}: No data returned, skipping")
+            continue
+
+        # Convert to DataFrame
+        df = pd.DataFrame(rates)
+
+        # MT5 returns: time, open, high, low, close, tick_volume, spread, real_volume
+        # Rename to match expected format
+        df = df.rename(columns={
+            'tick_volume': 'volume'
+        })
+
+        # Convert time from unix timestamp to datetime
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+
+        # Keep only required columns
+        df = df[['time', 'open', 'high', 'low', 'close', 'volume']]
+
+        # Store with base symbol name (without .x suffix)
+        data[symbol] = df
+        logger.info(f"  {symbol}: {len(df)} bars fetched from MT5")
+
+    mt5.shutdown()
+
+    if not data:
+        logger.warning("No data fetched from MT5 for any symbol")
+        return None
+
+    return data
+
+
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
     """Add technical features for model training."""
     df = df.copy()
@@ -720,15 +812,22 @@ def run_training_pipeline(args):
     # Step 1: Load/Generate Data
     logger.info("\n[1/5] Loading Training Data...")
 
-    # Try to use MT5 data fetcher, fall back to synthetic
-    try:
-        from data.mt5_fetcher import MT5DataFetcher
-        fetcher = MT5DataFetcher()
-        # This would need proper MT5 connection
-        data = generate_synthetic_data(config['symbols'], 5000)
-    except:
-        logger.info("Using synthetic data (MT5 not available)")
-        data = generate_synthetic_data(config['symbols'], 5000)
+    # Calculate bars needed based on years of data
+    # Assuming H1 timeframe: ~24 bars/day * 365 days * years
+    bars_needed = int(24 * 365 * config['years_of_data'])
+
+    # Try to fetch real MT5 data first, fall back to synthetic
+    data = fetch_mt5_data(
+        symbols=config['symbols'],
+        timeframe=config['timeframe'],
+        bars_per_symbol=bars_needed
+    )
+
+    if data is None:
+        logger.info("MT5 data unavailable, using synthetic data for training")
+        data = generate_synthetic_data(config['symbols'], bars_needed)
+    else:
+        logger.info(f"Successfully loaded real MT5 data for {len(data)} symbols")
 
     if not data:
         logger.error("No data loaded. Exiting.")
