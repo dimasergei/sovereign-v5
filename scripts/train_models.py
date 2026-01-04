@@ -382,6 +382,23 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def clean_data(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """Remove NaN and infinity values from training data."""
+    original_len = len(df)
+
+    # Replace inf with NaN
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    # Drop rows with NaN
+    df = df.dropna()
+
+    dropped = original_len - len(df)
+    if dropped > 0:
+        logger.info(f"    {symbol}: Dropped {dropped} rows with NaN/inf ({dropped/original_len*100:.1f}%)")
+
+    return df
+
+
 def prepare_sequences(
     df: pd.DataFrame,
     sequence_length: int = 50,
@@ -837,7 +854,8 @@ def run_training_pipeline(args):
     logger.info("\n[2/5] Engineering Features...")
     for symbol in data:
         data[symbol] = add_features(data[symbol])
-        logger.info(f"  {symbol}: {data[symbol].shape[1]} features")
+        data[symbol] = clean_data(data[symbol], symbol)
+        logger.info(f"  {symbol}: {data[symbol].shape[1]} features, {len(data[symbol])} rows")
 
     # Step 3: Split
     logger.info("\n[3/5] Splitting Train/Test...")
