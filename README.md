@@ -29,7 +29,7 @@ A production-grade autonomous trading system for managing multiple prop firm acc
 
 ### What It Does
 
-Sovereign V5 autonomously trades a portfolio of 6 elite symbols across multiple prop firm accounts:
+Sovereign V5 autonomously trades a portfolio of 6 elite symbols across multiple prop firm accounts, plus cryptocurrency for 24/7 coverage:
 
 | Symbol | Type | Why Selected |
 |--------|------|--------------|
@@ -39,6 +39,8 @@ Sovereign V5 autonomously trades a portfolio of 6 elite symbols across multiple 
 | UK100 | Index | European session coverage |
 | SPX500 | Index | US session, high liquidity |
 | EURUSD | Forex | Most liquid pair, tight spreads |
+| BTCUSD | Crypto | 24/7 trading, The5ers only |
+| ETHUSD | Crypto | 24/7 trading, The5ers only |
 
 ### Account Structure
 
@@ -47,7 +49,7 @@ Sovereign V5 autonomously trades a portfolio of 6 elite symbols across multiple 
 | GFT_1 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 2% floating loss = instant closure |
 | GFT_2 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 2-min minimum trade duration |
 | GFT_3 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 15% consistency rule |
-| THE5ERS_1 | The5ers High Stakes | $5,000 | 5% | 10% static | No per-trade limit |
+| THE5ERS_1 | The5ers High Stakes | $5,000 | 5% | 10% static | Crypto 24/7 trading enabled |
 
 **Total Capital Under Management:** $35,000
 
@@ -111,6 +113,13 @@ sovereign-v5/
 │       ├── order_flow.py
 │       ├── vpin.py
 │       └── trade_imbalance.py
+│
+├── crypto/                    # Cryptocurrency trading (The5ers 24/7)
+│   ├── __init__.py           # Module exports
+│   ├── crypto_strategy.py    # Main crypto strategy engine
+│   ├── regime_detector.py    # Market regime classification
+│   ├── liquidity_hunter.py   # Stop hunt detection
+│   └── crypto_position_sizer.py  # Volatility-adjusted sizing
 │
 ├── models/                    # ML models
 │   ├── base.py               # Base model interface
@@ -296,6 +305,41 @@ Risk Scalar:
 - DD 50-100% of guardian → Linear reduction to 0.25
 - DD >= guardian → 0.0 (no new trades)
 ```
+
+---
+
+## Cryptocurrency Trading
+
+### Overview
+
+The5ers account trades BTCUSD and ETHUSD 24/7 using a specialized crypto strategy engine with:
+
+- **Regime Detection** - Identifies trending vs ranging markets
+- **Liquidity Hunt Detection** - Spots stop hunts for reversal entries
+- **Multi-Timeframe Alignment** - 4H + 1H trend confirmation
+- **Volatility-Adjusted Sizing** - Reduces size in high volatility
+
+### Crypto Parameters
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Timeframe | 1H | Less noise than M15 |
+| Max Risk | 0.5% | Half of forex (more volatile) |
+| Min R:R | 2:1 | Larger targets for volatility |
+| Max Positions | 2 | Limit crypto exposure |
+| Regime Filter | Yes | Skip RANGING_VOLATILE |
+
+### Symbol Suffix Handling
+
+**Important:** Symbol suffixes differ between paper and live trading:
+
+| Mode | MT5 Instance | Crypto Symbols | Forex/Indices |
+|------|--------------|----------------|---------------|
+| Paper Trading | GFT Account 1 | BTCUSD.x, ETHUSD.x | XAUUSD.x, etc. |
+| Live (The5ers) | The5ers MT5 | BTCUSD, ETHUSD | XAUUSD, etc. |
+| Live (GFT) | GFT MT5 | N/A | XAUUSD.x, etc. |
+
+Paper trading uses GFT's MT5 for data, which requires the `.x` suffix for all symbols including crypto. Live trading on The5ers uses their own MT5 instance without the suffix.
 
 ---
 
