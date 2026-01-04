@@ -793,13 +793,16 @@ class PaperTradingRunner:
 
     def _scan_crypto_signals(self):
         """Scan for crypto signals for The5ers account (24/7 trading)."""
-        for symbol in CRYPTO_SYMBOLS:
+        # Use .x suffix symbols for data fetching (GFT MT5 requires suffix)
+        for symbol_with_suffix in CRYPTO_SYMBOLS_PAPER:
+            # Base symbol without suffix (for signal generation and tracking)
+            symbol = symbol_with_suffix.replace('.x', '')
             try:
                 # Crypto trades 24/7 - no market hours check needed
 
-                # Get 1H data for primary signal
+                # Get 1H data for primary signal (use suffixed symbol for MT5)
                 df_1h = self.data_fetcher.get_historical_bars(
-                    symbol, CRYPTO_TIMEFRAME, CRYPTO_BARS_TO_FETCH
+                    symbol_with_suffix, CRYPTO_TIMEFRAME, CRYPTO_BARS_TO_FETCH
                 )
 
                 if df_1h.empty or len(df_1h) < 100:
