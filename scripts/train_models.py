@@ -500,7 +500,14 @@ def train_hmm(data: Dict[str, pd.DataFrame], config: dict) -> Any:
         return None
 
     combined = np.vstack(observations)
-    combined = np.nan_to_num(combined, nan=0.0)
+
+    # Clean observations - remove inf and nan values
+    original_len = len(combined)
+    combined = np.where(np.isinf(combined), np.nan, combined)
+    mask = ~np.isnan(combined).any(axis=1)
+    combined = combined[mask]
+    logger.info(f"Cleaned observations: {original_len} -> {len(combined)} ({original_len - len(combined)} removed)")
+
     logger.info(f"Training on {len(combined)} total observations")
 
     try:
