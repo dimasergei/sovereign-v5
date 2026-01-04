@@ -24,6 +24,13 @@ import pandas as pd
 from strategies.multi_alpha_engine import MultiAlphaEngine, CombinedSignal
 from config.trading_params import get_params
 
+# ML Signal Adapter - optional, gracefully degrades if models not trained
+try:
+    from signals.ml_signal_adapter import MLSignalAdapter
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,12 +77,21 @@ class SignalGenerator:
     Each signal is smaller, but many compound to high returns.
     """
 
-    def __init__(self, min_confidence: float = 0.40):
+    def __init__(
+        self,
+        min_confidence: float = 0.40,
+        use_ml: bool = True,
+        ml_mode: str = 'filter',
+        ml_confidence_threshold: float = 0.5
+    ):
         """
         Initialize signal generator.
 
         Args:
-            min_confidence: Minimum confidence for a signal (default 0.40, lowered from 0.50)
+            min_confidence: Minimum confidence for a signal (default 0.40)
+            use_ml: Whether to use ML models if available
+            ml_mode: ML operating mode ('filter', 'confirm', 'replace')
+            ml_confidence_threshold: Minimum ML confidence to act
         """
         self.multi_alpha = MultiAlphaEngine()
         self.related_data_cache: Dict[str, pd.DataFrame] = {}
@@ -87,6 +103,25 @@ class SignalGenerator:
             "short": 0,
             "neutral": 0
         }
+
+        # ML Signal Adapter - optional enhancement
+        self.ml_adapter = None
+        self.use_ml = use_ml
+
+        if use_ml and ML_AVAILABLE:
+            try:
+                self.ml_adapter = MLSignalAdapter(
+                    mode=ml_mode,
+                    confidence_threshold=ml_confidence_threshold,
+                    load_models=True
+                )
+                if self.ml_adapter.is_ready():
+                    logger.info(f"ML adapter initialized (mode={ml_mode})")
+                else:
+                    logger.info("ML adapter loaded but no models available")
+            except Exception as e:
+                logger.warning(f"Failed to initialize ML adapter: {e}")
+                self.ml_adapter = None
 
     def generate_signal(
         self,
@@ -147,7 +182,8 @@ class SignalGenerator:
                 atr=atr
             )
 
-        return TradingSignal(
+        # Create base signal from rule-based strategies
+        signal = TradingSignal(
             symbol=symbol,
             action=combined.action,
             direction=combined.direction,
@@ -163,6 +199,88 @@ class SignalGenerator:
             atr=atr,
             contributing_models=combined.strategies_agreeing
         )
+
+        # Apply ML filtering if available and enabled
+        if self.ml_adapter is not None and self.ml_adapter.is_ready():
+            try:
+                # Prepare features for ML models
+                features = self._prepare_ml_features(df)
+                if features is not None:
+                    signal = self.ml_adapter.filter_signal(signal, features, symbol)
+
+                    # Update signal counts if ML vetoed
+                    if signal.action == "neutral" and combined.action != "neutral":
+                        self.signal_counts["neutral"] += 1
+                        self.signal_counts[combined.action] -= 1
+            except Exception as e:
+                logger.debug(f"ML filtering failed: {e}")
+
+        return signal
+
+    def _prepare_ml_features(self, df: pd.DataFrame) -> Optional[np.ndarray]:
+        """
+        Prepare features for ML models from OHLCV data.
+
+        Returns:
+            Feature array suitable for LSTM/Transformer (sequence_length, n_features)
+        """
+        if len(df) < 50:
+            return None
+
+        try:
+            # Use last 50 bars
+            df_recent = df.tail(50).copy()
+
+            # Calculate features
+            close = df_recent['close'].values
+            high = df_recent['high'].values
+            low = df_recent['low'].values
+
+            features = []
+
+            # Returns
+            returns = np.diff(close) / close[:-1]
+            returns = np.concatenate([[0], returns])
+            features.append(returns)
+
+            # Volatility (rolling std of returns)
+            vol = pd.Series(returns).rolling(10, min_periods=1).std().values
+            features.append(vol)
+
+            # RSI
+            delta = np.diff(close)
+            gain = np.where(delta > 0, delta, 0)
+            loss = np.where(delta < 0, -delta, 0)
+            avg_gain = pd.Series(gain).rolling(14, min_periods=1).mean().values
+            avg_loss = pd.Series(loss).rolling(14, min_periods=1).mean().values
+            rs = avg_gain / (avg_loss + 1e-10)
+            rsi = 100 - (100 / (1 + rs))
+            rsi = np.concatenate([[50], rsi])  # Pad first value
+            features.append(rsi / 100)  # Normalize to 0-1
+
+            # Price momentum
+            mom_10 = close / np.roll(close, 10) - 1
+            mom_10[:10] = 0
+            features.append(mom_10)
+
+            # ATR percentage
+            tr = np.maximum(high - low, np.abs(high - np.roll(close, 1)))
+            tr = np.maximum(tr, np.abs(low - np.roll(close, 1)))
+            atr = pd.Series(tr).rolling(14, min_periods=1).mean().values
+            atr_pct = atr / close
+            features.append(atr_pct)
+
+            # Stack features
+            feature_matrix = np.column_stack(features)
+
+            # Handle NaN/Inf
+            feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+            return feature_matrix
+
+        except Exception as e:
+            logger.debug(f"Feature preparation failed: {e}")
+            return None
 
     def update_related_data(self, symbol: str, df: pd.DataFrame):
         """Cache related symbol data for lead-lag strategy."""
