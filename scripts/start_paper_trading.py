@@ -98,8 +98,11 @@ ACCOUNTS = [
 # Elite Portfolio - Top 6 by Sharpe ratio (use .x suffix for GFT broker)
 SYMBOLS = ["XAUUSD.x", "XAGUSD.x", "NAS100.x", "UK100.x", "SPX500.x", "EURUSD.x"]
 
-# Crypto symbols for The5ers 24/7 trading (no suffix needed)
+# Crypto symbols for The5ers 24/7 trading
+# NOTE: Paper trading uses GFT account 1's MT5 instance which requires .x suffix
+# Live trading will use The5ers' own MT5 instance which does NOT use the suffix
 CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]
+CRYPTO_SYMBOLS_PAPER = ["BTCUSD.x", "ETHUSD.x"]  # For paper trading (GFT MT5)
 
 # Combined symbols for The5ers (trades both forex/indices AND crypto)
 THE5ERS_SYMBOLS = ["XAUUSD", "XAGUSD", "NAS100", "UK100", "SPX500", "EURUSD", "BTCUSD", "ETHUSD"]
@@ -882,9 +885,13 @@ class PaperTradingRunner:
             if sig.position_size <= 0:
                 return
 
+            # Paper trading uses GFT MT5 which requires .x suffix
+            # Live trading will use The5ers' own MT5 (no suffix needed)
+            symbol_for_trade = f"{sig.symbol}.x"
+
             # Execute trade
             success, msg, position = executor.open_position(
-                symbol=sig.symbol,
+                symbol=symbol_for_trade,
                 direction=sig.action,
                 size=sig.position_size,
                 entry_price=sig.entry_price,
@@ -902,13 +909,13 @@ class PaperTradingRunner:
             if success:
                 self.total_trades += 1
                 self.logger.info(
-                    f"[THE5ERS_1] CRYPTO TRADE OPENED: {sig.action.upper()} {sig.symbol} "
+                    f"[THE5ERS_1] CRYPTO TRADE OPENED: {sig.action.upper()} {symbol_for_trade} "
                     f"size={sig.position_size:.4f} @ {sig.entry_price:.2f} "
                     f"SL={sig.stop_loss:.2f} TP={sig.take_profit:.2f}"
                 )
                 # Send Telegram notification
                 self.telegram.send_trade_opened(
-                    "THE5ERS_1", sig.symbol, sig.action,
+                    "THE5ERS_1", symbol_for_trade, sig.action,
                     sig.position_size, sig.entry_price, sig.stop_loss, sig.take_profit,
                     risk_amount=sig.risk_amount,
                     risk_pct=sig.risk_pct * 100
