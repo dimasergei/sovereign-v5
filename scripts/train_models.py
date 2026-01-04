@@ -508,6 +508,15 @@ def train_hmm(data: Dict[str, pd.DataFrame], config: dict) -> Any:
     combined = combined[mask]
     logger.info(f"Cleaned observations: {original_len} -> {len(combined)} ({original_len - len(combined)} removed)")
 
+    # Standardize observations to prevent overflow in HMM Gaussian calculations
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    combined = scaler.fit_transform(combined)
+
+    # Clip extreme values (beyond 5 std devs)
+    combined = np.clip(combined, -5, 5)
+
+    logger.info(f"Standardized observations: mean={combined.mean():.4f}, std={combined.std():.4f}")
     logger.info(f"Training on {len(combined)} total observations")
 
     try:
