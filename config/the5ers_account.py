@@ -18,7 +18,10 @@ TELEGRAM_CHAT_IDS = [7898079111]
 # Elite Portfolio - Top 6 by Sharpe ratio (projected +63% annual)
 # Plus BTCUSD and ETHUSD for 24/7 crypto coverage
 SYMBOLS = ["XAUUSD", "XAGUSD", "NAS100", "UK100", "SPX500", "EURUSD"]
-CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]  # 24/7 trading
+
+# Crypto symbols for 24/7 trading (no .x suffix for The5ers live MT5 instance)
+# NOTE: Paper trading uses GFT MT5 which requires .x suffix - handled in start_paper_trading.py
+CRYPTO_SYMBOLS = ["BTCUSD", "ETHUSD"]
 ALL_SYMBOLS = SYMBOLS + CRYPTO_SYMBOLS
 
 TIMEFRAME = "M15"
