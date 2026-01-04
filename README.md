@@ -46,9 +46,9 @@ Sovereign V5 autonomously trades a portfolio of 6 elite symbols across multiple 
 
 | Account | Firm | Size | Daily DD | Total DD | Special Rules |
 |---------|------|------|----------|----------|---------------|
-| GFT_1 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 2% floating loss = instant closure |
-| GFT_2 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 2-min minimum trade duration |
-| GFT_3 | GFT Instant GOAT | $10,000 | 4% | 6% trailing | 15% consistency rule |
+| GFT_1 | GFT Instant GOAT | $10,000 | 3% | 6% trailing | 2% floating loss = instant closure |
+| GFT_2 | GFT Instant GOAT | $10,000 | 3% | 6% trailing | 2-min minimum trade duration |
+| GFT_3 | GFT Instant GOAT | $10,000 | 3% | 6% trailing | 15% consistency rule |
 | THE5ERS_1 | The5ers High Stakes | $5,000 | 5% | 10% static | Crypto 24/7 trading enabled |
 
 **Total Capital Under Management:** $35,000
